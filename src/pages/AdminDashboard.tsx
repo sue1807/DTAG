@@ -1677,16 +1677,19 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                     <button onClick={() => { setSForm({...emptySForm, period}); settlPdfRef.current?.click(); }} style={{...ghostBtn(), fontSize:12, padding:"5px 9px"}} disabled={pdfParsing}>
                       {pdfParsing ? "解析…" : "↑ PDF"}
                     </button>
-                    <button onClick={async () => {
+                    <button onClick={() => {
+                      console.log("❌ 点击了截图按钮");
                       const input = document.createElement("input");
                       input.type = "file";
                       input.accept = "image/*";
-                      input.onchange = async (e) => {
-                        const file = (e.target as HTMLInputElement).files?.[0];
+                      input.onchange = (e: any) => {
+                        console.log("✓ input change 事件触发");
+                        const file = e.target.files?.[0];
                         if (file) {
+                          console.log("📸 获取到文件:", file.name);
                           setSForm({...emptySForm, period});
                           setSettlView("edit");
-                          await handleImgUpload({target: {files: [file]}} as any);
+                          handleImgUpload(e);
                         }
                       };
                       input.click();
