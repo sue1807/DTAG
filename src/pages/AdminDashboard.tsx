@@ -95,7 +95,7 @@ async function parsePdf(file: File): Promise<any> {
   const txMatch     = fullText.match(/Total Transaction Fees\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)/);
   const exe_aud     = txMatch ? toNum(txMatch[1]) : null;
   const exe_hkd     = txMatch ? toNum(txMatch[2]) : null;
-  const petMatch = fullText.match(/Post Exchange Total\s+([\d,.]+)\s+([\d,.]+)\s+([\d,]+\.?\d*)/);
+  const petMatch = fullText.match(/Post Exchange Total\s+([-\d,.]+)\s+([-\d,.]+)\s+([-\d,]+\.?\d*)/);
   const post_exchange_aud = petMatch ? toNum(petMatch[1]) : null;
   const post_exchange_hkd = petMatch ? toNum(petMatch[2]) : null;
   const post_exchange_usd = petMatch ? toNum(petMatch[3]) : null;
