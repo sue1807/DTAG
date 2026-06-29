@@ -14,7 +14,66 @@ const f2 = (n: number) =>
 
 const toNum = (s: string) => parseFloat(s?.replace(/,/g, "") || "0") || 0;
 
+// 从 payment_exchange 提取汇率2；如有 HKD→USD 缺失但有 AUD→HKD loss_coverage，可推算 fx_hkd_usd
+// 注意：loss_coverage 里的 AUD→USD 是汇率1，不用于此处
+function deriveFxRates(lc: any[], pe: any[]): { fxAudUsd: number; fxHkdUsd: number } {
+  const peAudUsd = pe?.find((r: any) => r.from_ccy === "AUD" && r.to_ccy === "USD");
+  const peHkdUsd = pe?.find((r: any) => r.from_ccy === "HKD" && r.to_ccy === "USD");
+  const lcAudHkd = lc?.find((r: any) => r.from_ccy === "AUD" && r.to_ccy === "HKD");
+
+  const fxAudUsd = peAudUsd ? parseFloat(peAudUsd.rate) : 0;
+  // fx_hkd_usd: 优先 payment_exchange 直接值；其次若有 payment_exchange 的 AUD/USD + loss_coverage 的 AUD/HKD 则推算
+  const fxHkdUsd = peHkdUsd ? parseFloat(peHkdUsd.rate)
+                 : (lcAudHkd && fxAudUsd) ? lcAudHkd.rate * fxAudUsd
+                 : 0;
+  return { fxAudUsd, fxHkdUsd };
+}
+
+const hasPaymentExchange = (pe: any[] | undefined | null) => Array.isArray(pe) && pe.length > 0;
+
+const peNum = (value: any) => {
+  const n = parseFloat(value);
+  return Number.isFinite(n) ? Number(n.toFixed(8)) : 0;
+};
+
+function normalizePaymentExchange(pe: any[] | undefined | null): string {
+  return JSON.stringify((pe ?? []).map((r: any) => ({
+    from_ccy: r.from_ccy ?? "",
+    to_ccy: r.to_ccy ?? "",
+    from_amount: peNum(r.from_amount),
+    to_amount: peNum(r.to_amount),
+    rate: peNum(r.rate),
+  })).sort((a: any, b: any) =>
+    `${a.from_ccy}-${a.to_ccy}-${a.from_amount}`.localeCompare(`${b.from_ccy}-${b.to_ccy}-${b.from_amount}`)
+  ));
+}
+
+function paymentExchangeDiffers(current: any[] | undefined | null, parsed: any[] | undefined | null): boolean {
+  return hasPaymentExchange(current) && hasPaymentExchange(parsed) && normalizePaymentExchange(current) !== normalizePaymentExchange(parsed);
+}
+
+function derivePaymentExchangeFx(pe: any[] | undefined | null): { fxAudUsd: number; fxHkdUsd: number } {
+  const peAudUsd = pe?.find((r: any) => r.from_ccy === "AUD" && r.to_ccy === "USD");
+  const peHkdUsd = pe?.find((r: any) => r.from_ccy === "HKD" && r.to_ccy === "USD");
+  return {
+    fxAudUsd: peAudUsd ? parseFloat(peAudUsd.rate) || 0 : 0,
+    fxHkdUsd: peHkdUsd ? parseFloat(peHkdUsd.rate) || 0 : 0,
+  };
+}
+
 // ── PDF Parser ───────────────────────────────────────────────
+function normalizePaymentExchangeRates(pe: any[] | undefined | null): any[] {
+  if (!Array.isArray(pe)) return [];
+  return pe.map((row: any) => {
+    const from = toNum(row.from_amount?.toString?.() ?? row.from_amount);
+    const to = toNum(row.to_amount?.toString?.() ?? row.to_amount);
+    if (from > 0 && to > 0) {
+      return { ...row, rate: (to / from).toFixed(8) };
+    }
+    return row;
+  });
+}
+
 async function parsePdf(file: File): Promise<any> {
   const pdfjsLib = (window as any).pdfjsLib;
   if (!pdfjsLib) throw new Error("PDF.js not loaded");
@@ -36,7 +95,10 @@ async function parsePdf(file: File): Promise<any> {
   const txMatch     = fullText.match(/Total Transaction Fees\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)/);
   const exe_aud     = txMatch ? toNum(txMatch[1]) : null;
   const exe_hkd     = txMatch ? toNum(txMatch[2]) : null;
-  const post_exchange_usd = g(/Post Exchange Total\s+[\d,.]*\s+[\d,.]*\s+([\d,]+\.?\d*)/);
+  const petMatch = fullText.match(/Post Exchange Total\s+([\d,.]+)\s+([\d,.]+)\s+([\d,]+\.?\d*)/);
+  const post_exchange_aud = petMatch ? toNum(petMatch[1]) : null;
+  const post_exchange_hkd = petMatch ? toNum(petMatch[2]) : null;
+  const post_exchange_usd = petMatch ? toNum(petMatch[3]) : null;
   const wire_fees_usd     = g(/(?:Last month(?:'s)?\s+\d+\s+wires?|Wire fees?)\s+([\d,]+\.?\d*)/i);
   const loss_coverage: any[] = [];
   const lcSection = fullText.match(/Loss Coverage Currency Exchange([\s\S]*?)(?:Payment Currency Exchange|Powered by|$)/);
@@ -66,98 +128,13 @@ async function parsePdf(file: File): Promise<any> {
     let m; while ((m = wdRegex.exec(wdSection[1])) !== null)
       erp_withdrawals.push({ ccy: m[1], amount: toNum(m[2]), date: m[3] });
   }
-  return { equity_aud, cut_aud, net_aud, exe_aud, equity_hkd, cut_hkd, net_hkd, exe_hkd, post_exchange_usd, wire_fees_usd, loss_coverage, payment_exchange, erp_deposits, erp_withdrawals };
+  return { equity_aud, cut_aud, net_aud, exe_aud, equity_hkd, cut_hkd, net_hkd, exe_hkd, post_exchange_aud, post_exchange_hkd, post_exchange_usd, wire_fees_usd, loss_coverage, payment_exchange, erp_deposits, erp_withdrawals };
 }
 
 // ── Email Notifications Component ────────────────────────────
-function EmailNotifications({ C, font, onCount }: { C: any; font: string; onCount?: (n: number) => void }) {
-  const [emails, setEmails]   = useState<any[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [expanded, setExpanded] = useState<string|null>(null);
-  const [fetched, setFetched] = useState(false);
-
-  const fetchEmails = async () => {
-    setLoading(true);
-    try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 1000,
-          system: "You search Gmail for emails from noreply@metro.dttw.com and return results as JSON only. No markdown, no preamble. Return an array of objects with fields: id, subject, date, snippet. Maximum 10 results, newest first.",
-          messages: [{ role: "user", content: "Search Gmail for emails from:noreply@metro.dttw.com. Return as JSON array with fields id, subject, date, snippet. If no emails found return []." }],
-          mcp_servers: [{ type: "url", url: "https://gmail.mcp.claude.com/mcp", name: "gmail" }],
-        }),
-      });
-      const data = await res.json();
-      const text = data.content?.filter((b: any) => b.type === "text").map((b: any) => b.text).join("");
-      const clean = text.replace(/```json|```/g, "").trim();
-      const match = clean.match(/\[[\s\S]*\]/);
-      if (match) {
-        const parsed = JSON.parse(match[0]);
-        setEmails(parsed);
-        onCount?.(parsed.length);
-      } else {
-        setEmails([]);
-        onCount?.(0);
-      }
-    } catch(e) {
-      setEmails([]);
-    }
-    setLoading(false);
-    setFetched(true);
-  };
-
-  useEffect(() => { fetchEmails(); }, []);
-
-  if (!fetched && !loading) return null;
-
-  return (
-    <div style={{ background: "#0A1422", border: `1px solid #1C2E44`, borderRadius: 14, padding: "18px 22px", marginBottom: 20 }}>
-      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom: emails.length > 0 ? 14 : 0 }}>
-        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-          <span style={{ fontSize:16 }}>📬</span>
-          <span style={{ fontSize:14, fontWeight:700, color: C.text }}>DTTW 通知</span>
-          {emails.length > 0 && (
-            <span style={{ fontSize:11, padding:"2px 8px", borderRadius:10, background:`${C.blue}22`, color:C.blue, fontWeight:600 }}>
-              {emails.length} 封
-            </span>
-          )}
-        </div>
-        <button onClick={fetchEmails} disabled={loading}
-          style={{ background:"transparent", border:`1px solid #1C2E44`, color: C.muted, padding:"5px 12px", borderRadius:6, cursor:"pointer", fontSize:12, fontFamily:font }}>
-          {loading ? "读取中…" : "↻ 刷新"}
-        </button>
-      </div>
-      {loading && <div style={{ fontSize:13, color: C.muted }}>正在读取 Gmail…</div>}
-      {fetched && !loading && emails.length === 0 && (
-        <div style={{ fontSize:13, color: C.muted }}>暂无 DTTW 邮件（转发规则设好后新邮件会出现在这里）</div>
-      )}
-      {emails.map((e: any) => (
-        <div key={e.id} style={{ borderTop:`1px solid #1C2E44`, paddingTop:12, marginTop:12 }}>
-          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", cursor:"pointer" }}
-            onClick={() => setExpanded(expanded === e.id ? null : e.id)}>
-            <div style={{ flex:1 }}>
-              <div style={{ fontSize:14, fontWeight:600, color: C.text, marginBottom:4 }}>{e.subject}</div>
-              <div style={{ fontSize:12, color: C.muted }}>{e.date}</div>
-            </div>
-            <span style={{ color: C.muted, fontSize:16, marginLeft:12 }}>{expanded === e.id ? "▲" : "▼"}</span>
-          </div>
-          {expanded === e.id && e.snippet && (
-            <div style={{ marginTop:10, fontSize:13, color: C.muted, background:`#ffffff06`, borderRadius:8, padding:"10px 14px", lineHeight:1.7 }}>
-              {e.snippet}
-            </div>
-          )}
-        </div>
-      ))}
-    </div>
-  );
-}
-
 // ── Component ────────────────────────────────────────────────
 export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
-  type Tab = "overview"|"performance"|"settlement"|"payouts"|"config"|"daily"|"records";
+  type Tab = "overview"|"performance"|"settlement"|"payouts"|"config"|"daily"|"readme";
   const [tab, setTab]                 = useState<Tab>("overview");
   const [period, setPeriod]           = useState(() => new Date().toISOString().slice(0, 7));
   const [balances, setBalances]       = useState<any[]>([]);
@@ -165,10 +142,10 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
   const [tradeRecords, setTradeRecords] = useState<any[]>([]);
   const [settlements, setSettlements] = useState<any[]>([]);
   const [dailyPerf, setDailyPerf]     = useState<any[]>([]);
-  const [dailyMonth, setDailyMonth]   = useState(() => new Date().toISOString().slice(0, 7));
+  const [overviewPerf, setOverviewPerf] = useState<any[]>([]);
   const [dailyPage, setDailyPage]     = useState(0);
   const [dailyDiff, setDailyDiff]     = useState<any>(null);
-  const DAILY_PAGE_SIZE = 60;
+  const DAILY_PAGE_SIZE = 25;
   const [dailyFilter, setDailyFilter] = useState({
     trader: "All",
     dateFrom: new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10),
@@ -199,11 +176,14 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
   const [sessionUsdTotal, setSessionUsdTotal] = useState(0);
   const [erpLedger, setErpLedger]   = useState<any[]>([]);
   const [erpForm, setErpForm]       = useState({ entry_date: new Date().toISOString().slice(0,10), type: "settlement_deposit", amount_usd: "", settlement_period: "", note: "" });
-  const [rawTradePage, setRawTradePage] = useState(0);
-  const [rawSettlPage, setRawSettlPage] = useState(0);
-  const RAW_PAGE_SIZE = 10;
-  const [readme, setReadme]       = useState<string>("");
-  const [readmeOpen, setReadmeOpen] = useState(false);
+  const [readme, setReadme] = useState<string>("");
+  const dailyUploadRef = useRef<HTMLInputElement>(null);
+  const [fetchingDaily, setFetchingDaily] = useState(false);
+  const settlPdfRef = useRef<HTMLInputElement>(null);
+  const settlImgRef = useRef<HTMLInputElement>(null);
+  const [fetchingSettl, setFetchingSettl] = useState(false);
+  const [selectedSettlPeriod, setSelectedSettlPeriod] = useState<string | null>(null);
+  const [settling, setSettling] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const pdfRef  = useRef<HTMLInputElement>(null);
 
@@ -218,43 +198,14 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
 
   const askConfirm = (msg: string, onOk: () => void) => setConfirmDlg({ msg, onOk });
 
-  // Email notification badge
-  const [emailCount, setEmailCount] = useState(0);
-  const [lastEmailCheck, setLastEmailCheck] = useState(0);
-
-  const checkEmails = async () => {
-    try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 500,
-          system: "Search Gmail for emails from noreply@metro.dttw.com. Return ONLY a JSON object like {count: 3} with the number of emails found. No markdown, no other text.",
-          messages: [{ role: "user", content: "How many emails from:noreply@metro.dttw.com are in Gmail? Return only {count: N}" }],
-          mcp_servers: [{ type: "url", url: "https://gmail.mcp.claude.com/mcp", name: "gmail" }],
-        }),
-      });
-      const data = await res.json();
-      const text = data.content?.filter((b: any) => b.type === "text").map((b: any) => b.text).join("") || "";
-      const match = text.match(/\{[^}]*"count"\s*:\s*(\d+)[^}]*\}/);
-      if (match) setEmailCount(parseInt(match[1]));
-    } catch(e) {}
-    setLastEmailCheck(Date.now());
-  };
-
-  // Poll every 5 minutes
-  useEffect(() => {
-    checkEmails();
-    const interval = setInterval(checkEmails, 5 * 60 * 1000);
-    return () => clearInterval(interval);
-  }, []);
 
   // Forms
   const [mForm, setMForm] = useState({ trader_id: "HONG045", type: "deposit", amount_usd: "", entry_date: new Date().toISOString().slice(0,10), note: "" });
-  const emptySForm = { period, equity_aud:"", cut_aud:"", net_aud:"", exe_aud:"", equity_hkd:"", cut_hkd:"", net_hkd:"", exe_hkd:"", post_exchange_usd:"", wire_fees_usd:"", fx_notes:"", loss_coverage:[] as any[], payment_exchange:[] as any[], erp_deposits:[] as any[], erp_withdrawals:[] as any[] };
+  const emptySForm = { period, equity_aud:"", cut_aud:"", net_aud:"", exe_aud:"", equity_hkd:"", cut_hkd:"", net_hkd:"", exe_hkd:"", post_exchange_aud:"", post_exchange_hkd:"", post_exchange_usd:"", wire_fees_usd:"", fx_notes:"", loss_coverage:[] as any[], payment_exchange:[] as any[], erp_deposits:[] as any[], erp_withdrawals:[] as any[] };
   const [sForm, setSForm] = useState<any>(emptySForm);
   const [fForm, setFForm] = useState<any>({ period:"2026-02", asx_aud:"264.44", chixa_usd:"129.00", hke_hkd:"451.70", office_usd:"150.00", wire_usd:"", fx_aud_usd:"", fx_hkd_usd:"" });
+  // "pdf"=当期PDF, "derived"=由loss coverage推算, "prev"=沿用上期, ""=手动/未知
+  const [fxSrc, setFxSrc] = useState<{ aud: string; hkd: string }>({ aud: "", hkd: "" });
   const emptyPForm = { payout_date: new Date().toISOString().slice(0,10), trader_id:"HONG045", balance_usd:"", reserve_usd:"1000", settle_usd:"", fx_cny:"", cny_amount:"", period_covered:"", bank_account:"", note:"" };
   const [pForm, setPForm] = useState<any>(emptyPForm);
   const emptyPayoutRow = (id = "HONG045") => {
@@ -279,77 +230,112 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
     // daily_performance 由 loadDailyData 按月懒加载，不在 reload 里批量拉
   };
   useEffect(() => { reload(); }, []);
-
-  // 按月懒加载：优先 daily_performance，没有则从 trade_records 拼月度汇总行
-  const loadDailyData = async (month: string) => {
-    const from = `${month}-01`;
-    const nextMonth = new Date(month + "-01");
-    nextMonth.setMonth(nextMonth.getMonth() + 1);
-    const to = nextMonth.toISOString().slice(0, 10);
-
-    // 1. 查 daily_performance
-    const { data: dpRows } = await supabase.from("daily_performance")
-      .select("*").gte("trade_date", from).lt("trade_date", to)
-      .order("trade_date", { ascending: false });
-
-    if (dpRows && dpRows.length > 0) {
-      setDailyPerf(dpRows);
-    } else {
-      // 2. 没有每日数据 → 从 trade_records 拼月度汇总行展示
-      const { data: trRows } = await supabase.from("trade_records")
-        .select("*").eq("period", month);
-      const synthetic = (trRows || []).map((r: any) => ({
-        id:            `tr-${r.id}`,
-        trade_date:    from,           // 月份第一天作为占位日期
-        trader_name:   r.trader_id,
-        currency:      r.ccy,
-        gross:         r.gross,
-        gateway_charge:r.gateway_charge,
-        sec_fee:       r.sec_fee ?? 0,
-        act_fee:       r.act_fee ?? 0,
-        clr_fee:       r.clr_fee ?? 0,
-        exe_fee:       r.exe_fee,
-        trading_total: (r.gross ?? 0) - (r.gateway_charge ?? 0),
-        shares_traded: 0,
-        trades_made:   0,
-        _source:       "trade_records",  // 标记来源
-      }));
-      setDailyPerf(synthetic);
-    }
-    setDailyPage(0);
-  };
-  useEffect(() => { if (tab === "daily") loadDailyData(dailyMonth); }, [tab, dailyMonth]);
-
   useEffect(() => {
     fetch(import.meta.env.BASE_URL + "README.md").then(r => r.text()).then(setReadme).catch(() => {});
   }, []);
 
+  // 按日期范围加载：月度确认数据（trade_records auto-monthly）优先覆盖当月每日明细，其余月份补全
+  const loadDailyData = async (from: string, to: string) => {
+    // 1. 计算范围内所有月份
+    const months: string[] = [];
+    const cur = new Date(from.slice(0, 7) + "-01");
+    const endMonth = new Date(to.slice(0, 7) + "-01");
+    while (cur <= endMonth) {
+      months.push(cur.toISOString().slice(0, 7));
+      cur.setMonth(cur.getMonth() + 1);
+    }
+
+    // 2. 拉 daily_performance 日数据（始终优先）
+    const { data: dpRows } = await supabase.from("daily_performance")
+      .select("*").gte("trade_date", from).lte("trade_date", to)
+      .order("trade_date", { ascending: false });
+    const allDp = dpRows || [];
+
+    // 3. 拉 trade_records，作为无日数据时的兜底（按交易员+月份粒度判断）
+    const { data: trAll } = await supabase.from("trade_records")
+      .select("*").in("period", months);
+    const nameToId = Object.fromEntries(Object.entries(TRADERS).map(([id, v]) => [v.name, id]));
+    const dpTraderMonths = new Set(allDp.map((r: any) => {
+      const tid = TRADERS[r.trader_name] ? r.trader_name : (nameToId[r.trader_name] ?? r.trader_name);
+      return `${tid}:${r.trade_date.slice(0, 7)}`;
+    }));
+    // 只有该交易员在该月完全没有日数据时，才用 trade_records 合成一行兜底
+    const synthetic: any[] = (trAll || [])
+      .filter((r: any) => !dpTraderMonths.has(`${r.trader_id}:${r.period}`))
+      .map((r: any) => ({
+        id:             `tr-${r.id}`,
+        trade_date:     `${r.period}-01`,
+        trader_name:    r.trader_id,
+        currency:       r.ccy,
+        gross:          r.gross,
+        gateway_charge: r.gateway_charge,
+        sec_fee:        r.sec_fee ?? 0,
+        act_fee:        r.act_fee ?? 0,
+        clr_fee:        r.clr_fee ?? 0,
+        exe_fee:        r.exe_fee,
+        trading_total:  (r.gross ?? 0) - (r.gateway_charge ?? 0),
+        shares_traded:  0,
+        trades_made:    0,
+        _source:        "trade_records",
+        _discrepancy:   r.discrepancy_note ?? null,
+      }));
+
+    // 4. 合并并按日期倒序
+    const all = [...allDp, ...synthetic]
+      .sort((a, b) => b.trade_date.localeCompare(a.trade_date));
+    setDailyPerf(all);
+    setDailyPage(0);
+  };
+  useEffect(() => {
+    if (tab === "daily") loadDailyData(dailyFilter.dateFrom, dailyFilter.dateTo);
+  }, [tab]);
+
+  // 加载 trader 卡片用的概览数据（本月 + 上月），独立于筛选器
+  useEffect(() => {
+    if (tab !== "daily") return;
+    const now = new Date();
+    const prevMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const from = prevMonth.toISOString().slice(0, 7) + "-01";
+    const to   = now.toISOString().slice(0, 10);
+    supabase.from("daily_performance")
+      .select("trader_name,trade_date,trading_total,gross,gateway_charge,exe_fee,currency")
+      .gte("trade_date", from).lte("trade_date", to)
+      .then(({ data }) => setOverviewPerf(data || []));
+  }, [tab]);
+
+
   // Load period_fees + existing calc results when period changes
   useEffect(() => {
     supabase.from("period_fees").select("*").eq("period", period).single().then(({ data }) => {
-      if (data) setFForm({
-        period:     data.period,
-        asx_aud:    data.asx_aud?.toString()    ?? "264.44",
-        chixa_usd:  data.chixa_usd?.toString()  ?? "129.00",
-        hke_hkd:    data.hke_hkd?.toString()    ?? "451.70",
-        office_usd: data.office_usd?.toString() ?? "150.00",
-        wire_usd:   data.wire_usd?.toString()   ?? "",
-        fx_aud_usd: data.fx_aud_usd?.toString() ?? "",
-        fx_hkd_usd: data.fx_hkd_usd?.toString() ?? "",
-      });
+      if (data) {
+        setFForm({
+          period:     data.period,
+          asx_aud:    data.asx_aud?.toString()    ?? "264.44",
+          chixa_usd:  data.chixa_usd?.toString()  ?? "129.00",
+          hke_hkd:    data.hke_hkd?.toString()    ?? "451.70",
+          office_usd: data.office_usd?.toString() ?? "150.00",
+          wire_usd:   data.wire_usd?.toString()   ?? "",
+          fx_aud_usd: data.fx_aud_usd?.toString() ?? "",
+          fx_hkd_usd: data.fx_hkd_usd?.toString() ?? "",
+        });
+        setFxSrc({ aud: "", hkd: "" }); // loaded from DB, source unknown (manual/prev already saved)
+      }
       else {
-        // No config for this period — auto-fill rates from last settlement's payment_exchange (汇率2)
+        // No config for this period — auto-fill rates from last confirmed settlement
         supabase.from("settlement_records")
-          .select("period, payment_exchange")
+          .select("period, payment_exchange, loss_coverage")
           .lt("period", period)
           .order("period", { ascending: false })
           .limit(1)
           .single()
           .then(({ data: last }) => {
-            const pe = last?.payment_exchange ?? [];
-            const audRate = pe.find((r: any) => r.from_ccy === "AUD" && r.to_ccy === "USD")?.rate?.toString() ?? "";
-            const hkdRate = pe.find((r: any) => r.from_ccy === "HKD" && r.to_ccy === "USD")?.rate?.toString() ?? "";
-            setFForm((f: any) => ({ ...f, period, fx_aud_usd: audRate, fx_hkd_usd: hkdRate }));
+            const { fxAudUsd, fxHkdUsd } = deriveFxRates(last?.loss_coverage ?? [], last?.payment_exchange ?? []);
+            setFForm((f: any) => ({
+              ...f, period,
+              fx_aud_usd: fxAudUsd ? fxAudUsd.toFixed(8) : "",
+              fx_hkd_usd: fxHkdUsd ? fxHkdUsd.toFixed(8) : "",
+            }));
+            setFxSrc({ aud: fxAudUsd ? "prev" : "", hkd: fxHkdUsd ? "prev" : "" });
           });
       }
     });
@@ -478,6 +464,12 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
     setPdfParsing(true);
     try {
       const parsed = await parsePdf(file);
+      const parsedPe = parsed.payment_exchange ?? [];
+      const targetPeriod = sForm.period || period;
+      const savedPe = settlements.find((s: any) => s.period === targetPeriod)?.payment_exchange ?? [];
+      const currentPe = hasPaymentExchange(savedPe) ? savedPe : (sForm.payment_exchange ?? []);
+      const protectPaymentExchange = hasPaymentExchange(currentPe);
+      const peDiff = paymentExchangeDiffers(currentPe, parsedPe);
       setSForm((p: any) => ({
         ...p,
         equity_aud: parsed.equity_aud?.toString() ?? p.equity_aud,
@@ -488,47 +480,100 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
         cut_hkd: parsed.cut_hkd?.toString() ?? p.cut_hkd,
         net_hkd: parsed.net_hkd?.toString() ?? p.net_hkd,
         exe_hkd: parsed.exe_hkd?.toString() ?? p.exe_hkd,
+        post_exchange_aud: parsed.post_exchange_aud?.toString() ?? p.post_exchange_aud,
+        post_exchange_hkd: parsed.post_exchange_hkd?.toString() ?? p.post_exchange_hkd,
         post_exchange_usd: parsed.post_exchange_usd?.toString() ?? p.post_exchange_usd,
         wire_fees_usd: parsed.wire_fees_usd?.toString() ?? p.wire_fees_usd,
         loss_coverage: parsed.loss_coverage?.length ? parsed.loss_coverage : p.loss_coverage,
-        payment_exchange: parsed.payment_exchange?.length ? parsed.payment_exchange : p.payment_exchange,
+        payment_exchange: hasPaymentExchange(savedPe) ? savedPe : (hasPaymentExchange(p.payment_exchange) ? p.payment_exchange : (hasPaymentExchange(parsedPe) ? parsedPe : p.payment_exchange)),
         erp_deposits: parsed.erp_deposits?.length ? parsed.erp_deposits : p.erp_deposits,
         erp_withdrawals: parsed.erp_withdrawals?.length ? parsed.erp_withdrawals : p.erp_withdrawals,
       }));
-      const audUsd = parsed.payment_exchange?.find((r: any) => r.from_ccy === "AUD" && r.to_ccy === "USD");
-      const hkdUsd = parsed.payment_exchange?.find((r: any) => r.from_ccy === "HKD" && r.to_ccy === "USD");
-      if (audUsd) setFForm((p: any) => ({ ...p, fx_aud_usd: audUsd.rate.toString() }));
-      if (hkdUsd) setFForm((p: any) => ({ ...p, fx_hkd_usd: hkdUsd.rate.toString() }));
-      showToast("PDF 解析成功");
+      if (!protectPaymentExchange && hasPaymentExchange(parsedPe)) {
+        const { fxAudUsd, fxHkdUsd } = derivePaymentExchangeFx(parsedPe);
+        if (fxAudUsd) setFForm((p: any) => ({ ...p, fx_aud_usd: fxAudUsd.toFixed(8) }));
+        if (fxHkdUsd) setFForm((p: any) => ({ ...p, fx_hkd_usd: fxHkdUsd.toFixed(8) }));
+        setFxSrc({ aud: fxAudUsd ? "pdf" : "", hkd: fxHkdUsd ? "pdf" : "" });
+      }
+      showToast(peDiff ? "PDF Payment Exchange 与当前已确认值不同，已保留当前值" : "PDF 解析成功");
+      setSettlView("edit");
     } catch (err: any) { showToast("解析失败: " + err.message, false); }
-    setPdfParsing(false); if (pdfRef.current) pdfRef.current.value = "";
+    setPdfParsing(false);
+    if (pdfRef.current) pdfRef.current.value = "";
+    if (settlPdfRef.current) settlPdfRef.current.value = "";
+  };
+
+  // ── Trigger settlement PDF fetch via local server ─────────
+  const triggerSettlFetch = async () => {
+    setFetchingSettl(true);
+    try {
+      const res = await fetch(
+        `${FETCH_SERVER}/fetch-settlement?period=${period}`,
+        { signal: AbortSignal.timeout(60000) }
+      );
+      if (!res.ok) throw new Error(await readLocalFetchError(res));
+      const r = await res.json();
+      if (r.error) throw new Error(r.error);
+      // Populate sForm with parsed data from server
+      const p = r.parsed ?? {};
+      const parsedPe = p.payment_exchange ?? [];
+      const { data: dbSettlement, error: dbSettlementError } = await supabase
+        .from("settlement_records")
+        .select("payment_exchange")
+        .eq("period", period)
+        .maybeSingle();
+      if (dbSettlementError) throw dbSettlementError;
+      const dbPe = dbSettlement?.payment_exchange ?? [];
+      const formPe = (sForm.period || period) === period ? sForm.payment_exchange ?? [] : [];
+      const currentPe = hasPaymentExchange(dbPe) ? dbPe : formPe;
+      const protectPaymentExchange = hasPaymentExchange(currentPe);
+      const peDiff = paymentExchangeDiffers(currentPe, parsedPe);
+      setSForm((prev: any) => {
+        const prevPe = (prev.period || period) === period ? prev.payment_exchange : [];
+        const finalPe = hasPaymentExchange(dbPe) ? dbPe : (hasPaymentExchange(prevPe) ? prevPe : parsedPe);
+        return { period, equity_aud: p.equity_aud?.toString() ?? "", cut_aud: p.cut_aud?.toString() ?? "", net_aud: p.net_aud?.toString() ?? "", exe_aud: p.exe_aud?.toString() ?? "", equity_hkd: p.equity_hkd?.toString() ?? "", cut_hkd: p.cut_hkd?.toString() ?? "", net_hkd: p.net_hkd?.toString() ?? "", exe_hkd: p.exe_hkd?.toString() ?? "", post_exchange_aud: p.post_exchange_aud?.toString() ?? "", post_exchange_hkd: p.post_exchange_hkd?.toString() ?? "", post_exchange_usd: p.post_exchange_usd?.toString() ?? "", wire_fees_usd: p.wire_fees_usd?.toString() ?? "", fx_notes: "", loss_coverage: p.loss_coverage ?? [], payment_exchange: finalPe, erp_deposits: p.erp_deposits ?? [], erp_withdrawals: p.erp_withdrawals ?? [] };
+      });
+      if (!protectPaymentExchange && hasPaymentExchange(parsedPe)) {
+        const { fxAudUsd, fxHkdUsd } = derivePaymentExchangeFx(parsedPe);
+        if (fxAudUsd) setFForm((f: any) => ({ ...f, fx_aud_usd: fxAudUsd.toFixed(8) }));
+        if (fxHkdUsd) setFForm((f: any) => ({ ...f, fx_hkd_usd: fxHkdUsd.toFixed(8) }));
+      }
+      showToast(peDiff ? "抓取到的 Payment Exchange 与当前已确认值不同，已保留当前值" : "PDF 抓取解析成功，请核对后保存");
+      setSettlView("edit");
+    } catch (e: any) {
+      if (e.message?.includes("fetch") || e.name === "TypeError") {
+        showToast("无法连接本地服务，请确认 fetch_server.py 已启动", false);
+      } else {
+        showToast("抓取失败: " + e.message, false);
+      }
+    }
+    setFetchingSettl(false);
   };
 
   const saveSettlement = async () => {
     setLoading(true);
     try {
-      const numFields = ["equity_aud","cut_aud","net_aud","exe_aud","equity_hkd","cut_hkd","net_hkd","exe_hkd","post_exchange_usd","wire_fees_usd"];
+      const numFields = ["equity_aud","cut_aud","net_aud","exe_aud","equity_hkd","cut_hkd","net_hkd","exe_hkd","post_exchange_aud","post_exchange_hkd","post_exchange_usd","wire_fees_usd"];
       const payload: any = { period: sForm.period || period };
       for (const k of numFields) payload[k] = sForm[k] !== "" ? parseFloat(sForm[k]) : null;
       payload.fx_notes = sForm.fx_notes || null;
-      payload.loss_coverage = sForm.loss_coverage; payload.payment_exchange = sForm.payment_exchange;
+      const finalPaymentExchange = normalizePaymentExchangeRates(sForm.payment_exchange);
+      payload.loss_coverage = sForm.loss_coverage; payload.payment_exchange = finalPaymentExchange;
       payload.erp_deposits = sForm.erp_deposits; payload.erp_withdrawals = sForm.erp_withdrawals;
       const { error } = await db.upsertSettlement(payload);
       if (error) throw error;
 
-      // Auto-sync fx rates to period_fees from payment_exchange
-      const audUsd = sForm.payment_exchange?.find((r: any) => r.from_ccy === "AUD" && r.to_ccy === "USD");
-      const hkdUsd = sForm.payment_exchange?.find((r: any) => r.from_ccy === "HKD" && r.to_ccy === "USD");
-      if (audUsd || hkdUsd) {
+      // Auto-sync fx rates only from the final confirmed payment_exchange.
+      const { fxAudUsd: saveAud, fxHkdUsd: saveHkd } = derivePaymentExchangeFx(finalPaymentExchange);
+      if (saveAud || saveHkd) {
         const fxPayload: any = { period: sForm.period || period };
-        if (audUsd) fxPayload.fx_aud_usd = parseFloat(audUsd.rate);
-        if (hkdUsd) fxPayload.fx_hkd_usd = parseFloat(hkdUsd.rate);
+        if (saveAud) fxPayload.fx_aud_usd = saveAud;
+        if (saveHkd) fxPayload.fx_hkd_usd = saveHkd;
         await supabase.from("period_fees").upsert(fxPayload, { onConflict: "period" });
-        if (audUsd) setFForm((f: any) => ({ ...f, fx_aud_usd: audUsd.rate.toString() }));
-        if (hkdUsd) setFForm((f: any) => ({ ...f, fx_hkd_usd: hkdUsd.rate.toString() }));
+        if (saveAud) setFForm((f: any) => ({ ...f, fx_aud_usd: saveAud.toFixed(8) }));
+        if (saveHkd) setFForm((f: any) => ({ ...f, fx_hkd_usd: saveHkd.toFixed(8) }));
       }
-
-      showToast("Settlement 已保存" + (audUsd || hkdUsd ? "，汇率已同步到结算参数" : "")); 
+      showToast("Settlement 已保存" + (saveAud || saveHkd ? "，汇率已同步" : "")); 
       reload(); setSettlView("list");
     } catch (e: any) { showToast(e.message, false); }
     setLoading(false);
@@ -708,11 +753,150 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
     setLoading(false);
   };
 
+  // ── Daily Performance Upload ─────────────────────────────
+  const handleDailyUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]; if (!file) return;
+    setLoading(true);
+    try {
+      const text = await file.text();
+      const lines = text.trim().split("\n");
+      const header = lines[0].split(",").map(h => h.trim().replace(/"/g, "").toLowerCase());
+      const get = (row: string[], key: string) => {
+        const i = header.indexOf(key); return i >= 0 ? row[i]?.replace(/"/g, "").trim() : "";
+      };
+      const rows = lines.slice(1).map(line => {
+        const cols = line.split(",");
+        return {
+          trade_date:     get(cols, "trade_date") || get(cols, "date"),
+          trader_name:    get(cols, "trader_name") || get(cols, "trader"),
+          currency:       get(cols, "currency") || get(cols, "ccy"),
+          gross:          parseFloat(get(cols, "gross")) || 0,
+          gateway_charge: parseFloat(get(cols, "gateway_charge") || get(cols, "gateway")) || 0,
+          sec_fee:        parseFloat(get(cols, "sec_fee")) || 0,
+          act_fee:        parseFloat(get(cols, "act_fee")) || 0,
+          exe_fee:        parseFloat(get(cols, "exe_fee")) || 0,
+          trading_total:  parseFloat(get(cols, "trading_total")) || 0,
+          shares:         parseFloat(get(cols, "shares")) || 0,
+          trades_made:    parseInt(get(cols, "trades_made")) || 0,
+        };
+      }).filter(r => r.trade_date && r.trader_name);
+      if (!rows.length) throw new Error("CSV 格式不匹配，未能解析出数据行");
+      const { error } = await supabase.from("daily_performance").upsert(rows, { onConflict: "trade_date,trader_name" });
+      if (error) throw error;
+      showToast(`已导入 ${rows.length} 条每日数据`);
+      loadDailyData(dailyFilter.dateFrom, dailyFilter.dateTo);
+    } catch (e: any) { showToast(e.message, false); }
+    setLoading(false);
+    if (dailyUploadRef.current) dailyUploadRef.current.value = "";
+  };
+
+  // ── Trigger Remote Fetch ──────────────────────────────────
+  const FETCH_SERVER = "http://localhost:18765";
+  const readLocalFetchError = async (res: Response) => {
+    const fallback = `服务器返回 ${res.status}`;
+    try {
+      const text = await res.text();
+      if (!text) return fallback;
+      try {
+        const body = JSON.parse(text);
+        return body.error || body.message || text;
+      } catch {
+        return text;
+      }
+    } catch {
+      return fallback;
+    }
+  };
+
+  const triggerDailyFetch = async () => {
+    setFetchingDaily(true);
+    try {
+      const res = await fetch(
+        `${FETCH_SERVER}/fetch?from=${dailyFilter.dateFrom}&to=${dailyFilter.dateTo}`,
+        { signal: AbortSignal.timeout(120000) }
+      );
+      if (!res.ok) throw new Error(await readLocalFetchError(res));
+      const r = await res.json();
+      if (r.error) throw new Error(r.error);
+      showToast(r.message || `抓取完成，共 ${r.rows ?? 0} 条`);
+      loadDailyData(dailyFilter.dateFrom, dailyFilter.dateTo);
+    } catch (e: any) {
+      if (e.message?.includes("fetch") || e.name === "TypeError") {
+        showToast("无法连接本地服务，请确认 fetch_server.py 已启动", false);
+      } else {
+        showToast("抓取失败: " + e.message, false);
+      }
+    }
+    setFetchingDaily(false);
+  };
+
+  const handleMonthlyFetch = async () => {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = now.getMonth() + 1;
+    const dateFrom = `${year}-${String(month).padStart(2, "0")}-01`;
+    const lastDay = new Date(year, month, 0).getDate();
+    const dateTo = `${year}-${String(month).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
+    setFetchingDaily(true);
+    try {
+      const res = await fetch(
+        `${FETCH_SERVER}/fetch?from=${dateFrom}&to=${dateTo}`,
+        { signal: AbortSignal.timeout(120000) }
+      );
+      if (!res.ok) throw new Error(await readLocalFetchError(res));
+      const r = await res.json();
+      if (r.error) throw new Error(r.error);
+      showToast(r.message || `全月抓取完成，共 ${r.rows ?? 0} 条`);
+      loadDailyData(dateFrom, dateTo);
+    } catch (e: any) {
+      if (e.message?.includes("fetch") || e.name === "TypeError") {
+        showToast("无法连接本地服务，请确认 fetch_server.py 已启动", false);
+      } else {
+        showToast("全月抓取失败: " + e.message, false);
+      }
+    }
+    setFetchingDaily(false);
+  };
+
+  const handleLockCurrentMonth = async () => {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = now.getMonth() + 1;
+    const period = `${year}-${String(month).padStart(2, "0")}`;
+    setLoading(true);
+    try {
+      const { error } = await supabase.from("daily_performance")
+        .update({ is_confirmed: true })
+        .like("trade_date", `${period}%`);
+      if (error) throw error;
+      showToast(`✓ ${period} 数据已锁定`);
+      loadDailyData(dailyFilter.dateFrom, dailyFilter.dateTo);
+    } catch (e: any) {
+      showToast("数据锁定失败: " + e.message, false);
+    }
+    setLoading(false);
+  };
+
   // ── Fees ─────────────────────────────────────────────────
   const saveFees = async () => {
     setLoading(true);
     try {
-      const payload = Object.fromEntries(Object.entries(fForm).map(([k, v]) => [k, k !== "period" && v !== "" ? parseFloat(v as string) : (v === "" ? null : v)]));
+      const editableFeeKeys = ["period", "asx_aud", "chixa_usd", "hke_hkd", "office_usd", "wire_usd"];
+      const payload = Object.fromEntries(
+        editableFeeKeys.map((k) => {
+          const v = fForm[k];
+          return [k, k !== "period" && v !== "" ? parseFloat(v as string) : (v === "" ? null : v)];
+        })
+      );
+      const { data: existingFee } = await supabase
+        .from("period_fees")
+        .select("period")
+        .eq("period", payload.period)
+        .maybeSingle();
+      if (!existingFee) {
+        payload.fx_aud_usd = 0;
+        payload.fx_hkd_usd = 0;
+      }
       const { error } = await db.upsertFees(payload);
       if (error) throw error; showToast("配置已保存");
     } catch (e: any) { showToast(e.message, false); }
@@ -734,23 +918,18 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
   const filledBtn = (bg = C.blue): React.CSSProperties => ({ padding: "10px 22px", borderRadius: 8, border: "none", background: bg, color: "#fff", cursor: loading ? "not-allowed" : "pointer", fontSize: 16, fontFamily: font, fontWeight: 600, opacity: loading ? 0.55 : 1 });
   const ghostBtn = (active = false): React.CSSProperties => ({ padding: "8px 16px", borderRadius: 8, border: `1px solid ${active ? C.blue : C.border}`, background: active ? `${C.blue}18` : "transparent", color: active ? C.blue : C.muted, cursor: "pointer", fontSize: 16, fontFamily: font, fontWeight: 500 });
 
-  // Simple markdown renderer (headers, code blocks, tables, bold, hr)
   const renderReadme = (md: string) => {
     const lines = md.split("\n");
     const out: React.ReactNode[] = [];
     let i = 0;
     while (i < lines.length) {
       const line = lines[i];
-      // Code block
       if (line.startsWith("```")) {
-        const lang = line.slice(3).trim();
-        const codeLines: string[] = [];
-        i++;
+        const codeLines: string[] = []; i++;
         while (i < lines.length && !lines[i].startsWith("```")) { codeLines.push(lines[i]); i++; }
         out.push(<pre key={i} style={{ background: C.elevated, border:`1px solid ${C.border}`, borderRadius: 8, padding: "12px 16px", fontSize: 14, overflowX: "auto", margin: "8px 0", color: C.text, fontFamily: "monospace" }}><code>{codeLines.join("\n")}</code></pre>);
         i++; continue;
       }
-      // Table row
       if (line.startsWith("|")) {
         const rows: string[][] = [];
         while (i < lines.length && lines[i].startsWith("|")) {
@@ -758,67 +937,36 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
           if (!cells.every(c => /^[-: ]+$/.test(c))) rows.push(cells);
           i++;
         }
-        if (rows.length > 0) {
-          out.push(
-            <div key={i} style={{ overflowX: "auto", margin: "8px 0" }}>
-              <table style={{ borderCollapse: "collapse", fontSize: 15, width: "100%" }}>
-                <thead>
-                  <tr>{rows[0].map((c,j) => <th key={j} style={{ border:`1px solid ${C.border}`, padding: "6px 12px", textAlign: "left", background: C.elevated, fontWeight: 700, color: C.text }}>{c}</th>)}</tr>
-                </thead>
-                <tbody>
-                  {rows.slice(1).map((row, ri) => (
-                    <tr key={ri}>{row.map((c, j) => <td key={j} style={{ border:`1px solid ${C.border}`, padding: "5px 12px", color: C.muted, fontFamily: c.startsWith("`") ? "monospace" : font }}>{c.replace(/^`|`$/g, "")}</td>)}</tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          );
-        }
+        if (rows.length > 0) out.push(<div key={i} style={{ overflowX: "auto", margin: "8px 0" }}><table style={{ borderCollapse: "collapse", fontSize: 15, width: "100%" }}><thead><tr>{rows[0].map((c,j) => <th key={j} style={{ border:`1px solid ${C.border}`, padding: "6px 12px", textAlign: "left", background: C.elevated, fontWeight: 700, color: C.text }}>{c}</th>)}</tr></thead><tbody>{rows.slice(1).map((row, ri) => (<tr key={ri}>{row.map((c, j) => <td key={j} style={{ border:`1px solid ${C.border}`, padding: "5px 12px", color: C.muted }}>{c.replace(/^`|`$/g, "")}</td>)}</tr>))}</tbody></table></div>);
         continue;
       }
-      // HR
       if (/^---+$/.test(line.trim())) { out.push(<hr key={i} style={{ border: "none", borderTop: `1px solid ${C.border}`, margin: "16px 0" }} />); i++; continue; }
-      // H1
-      if (line.startsWith("# ")) { out.push(<h1 key={i} style={{ fontSize: 22, fontWeight: 700, color: C.text, margin: "20px 0 8px" }}>{line.slice(2)}</h1>); i++; continue; }
-      // H2
-      if (line.startsWith("## ")) { out.push(<h2 key={i} style={{ fontSize: 18, fontWeight: 700, color: C.text, margin: "16px 0 6px" }}>{line.slice(3)}</h2>); i++; continue; }
-      // H3
-      if (line.startsWith("### ")) { out.push(<h3 key={i} style={{ fontSize: 16, fontWeight: 700, color: C.blue, margin: "12px 0 4px" }}>{line.slice(4)}</h3>); i++; continue; }
-      // Inline: bold + inline code
-      const inlineRender = (text: string) => {
-        const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
-        return parts.map((p, pi) => {
-          if (p.startsWith("**") && p.endsWith("**")) return <strong key={pi} style={{ color: C.text }}>{p.slice(2, -2)}</strong>;
-          if (p.startsWith("`") && p.endsWith("`")) return <code key={pi} style={{ background: C.elevated, borderRadius: 3, padding: "1px 5px", fontSize: 14, fontFamily: "monospace", color: C.green }}>{p.slice(1, -1)}</code>;
-          return p;
-        });
-      };
-      // Blockquote
-      if (line.startsWith("> ")) { out.push(<blockquote key={i} style={{ borderLeft: `3px solid ${C.blue}`, paddingLeft: 12, margin: "6px 0", color: C.muted, fontSize: 15 }}>{inlineRender(line.slice(2))}</blockquote>); i++; continue; }
-      // List item
-      if (line.startsWith("- ") || line.startsWith("  - ")) {
-        const indent = line.startsWith("  ") ? 20 : 0;
-        out.push(<div key={i} style={{ display: "flex", gap: 6, margin: "3px 0", paddingLeft: indent, fontSize: 15 }}><span style={{ color: C.blue, flexShrink: 0 }}>·</span><span style={{ color: C.muted }}>{inlineRender(line.replace(/^\s*-\s/, ""))}</span></div>);
-        i++; continue;
-      }
-      // Blank line
+      if (line.startsWith("# "))  { out.push(<h1 key={i} style={{ fontSize: 22, fontWeight: 700, color: C.text,  margin: "20px 0 8px" }}>{line.slice(2)}</h1>);  i++; continue; }
+      if (line.startsWith("## ")) { out.push(<h2 key={i} style={{ fontSize: 18, fontWeight: 700, color: C.text,  margin: "16px 0 6px" }}>{line.slice(3)}</h2>); i++; continue; }
+      if (line.startsWith("### ")){ out.push(<h3 key={i} style={{ fontSize: 16, fontWeight: 700, color: C.blue,  margin: "12px 0 4px" }}>{line.slice(4)}</h3>); i++; continue; }
+      const inline = (text: string) => text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).map((p, pi) => {
+        if (p.startsWith("**") && p.endsWith("**")) return <strong key={pi} style={{ color: C.text }}>{p.slice(2,-2)}</strong>;
+        if (p.startsWith("`")  && p.endsWith("`"))  return <code key={pi} style={{ background: C.elevated, borderRadius: 3, padding: "1px 5px", fontSize: 14, fontFamily: "monospace", color: C.green }}>{p.slice(1,-1)}</code>;
+        return p;
+      });
+      if (line.startsWith("> ")) { out.push(<blockquote key={i} style={{ borderLeft: `3px solid ${C.blue}`, paddingLeft: 12, margin: "6px 0", color: C.muted, fontSize: 15 }}>{inline(line.slice(2))}</blockquote>); i++; continue; }
+      if (line.startsWith("- ") || line.startsWith("  - ")) { out.push(<div key={i} style={{ display: "flex", gap: 6, margin: "3px 0", paddingLeft: line.startsWith("  ") ? 20 : 0, fontSize: 15 }}><span style={{ color: C.blue, flexShrink: 0 }}>·</span><span style={{ color: C.muted }}>{inline(line.replace(/^\s*-\s/, ""))}</span></div>); i++; continue; }
       if (line.trim() === "") { out.push(<div key={i} style={{ height: 6 }} />); i++; continue; }
-      // Paragraph
-      out.push(<p key={i} style={{ fontSize: 15, color: C.muted, margin: "4px 0", lineHeight: 1.7 }}>{inlineRender(line)}</p>);
+      out.push(<p key={i} style={{ fontSize: 15, color: C.muted, margin: "4px 0", lineHeight: 1.7 }}>{inline(line)}</p>);
       i++;
     }
     return out;
   };
+
   const tag = (color: string): React.CSSProperties => ({ fontSize: 13, padding: "2px 8px", borderRadius: 4, background: `${color}18`, color, fontWeight: 600, display: "inline-block" });
 
   const TABS: { k: Tab; l: string }[] = [
     { k: "overview",    l: "交易员概要" },
-    { k: "performance", l: "交易业绩" },
+    { k: "daily",       l: "业绩查询" },
     { k: "settlement",  l: "Settlement" },
     { k: "payouts",     l: "提成发放" },
-    { k: "daily",       l: "每日业绩" },
     { k: "config",      l: "结算参数" },
-    { k: "records",     l: "原始记录" },
+    { k: "readme",      l: "系统文档" },
   ];
 
   const alertCount = balances.filter(b => b.status !== "ok").length;
@@ -848,9 +996,6 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
           {TABS.map(t => (
             <button key={t.k} onClick={() => setTab(t.k)} style={{ ...sideNavBtn(tab === t.k), position: "relative" }}>
               {t.l}
-              {t.k === "settlement" && emailCount > 0 && (
-                <span style={{ position: "absolute", top: 12, right: 14, width: 7, height: 7, borderRadius: "50%", background: "#F05050" }} />
-              )}
             </button>
           ))}
         </nav>
@@ -883,7 +1028,7 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
         )}
 
         {/* Top bar with period selector (only for tabs that need it) */}
-        {(["performance","settlement","config","payouts"] as Tab[]).includes(tab) && (
+        {(["performance","payouts"] as Tab[]).includes(tab) && (
           <div style={{ padding: "14px 32px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "flex-end", background: C.surface, gap: 10 }}>
             <span style={{ fontSize: 15, color: C.muted }}>月份</span>
             <select value={period} onChange={e => setPeriod(e.target.value)} style={{ ...inp, width: 120, padding: "7px 12px", fontSize: 15 }}>
@@ -969,19 +1114,40 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
             <div style={{ ...card, padding:0, overflow:"hidden" }}>
               <div style={{ padding:"16px 24px", fontSize:15, fontWeight:600, borderBottom:`1px solid ${C.border}` }}>保证金流水</div>
               <div style={{ display:"grid", gridTemplateColumns:"110px 100px 80px 90px 120px 120px 1fr 34px", padding:"9px 24px", gap:12, fontSize:11, fontWeight:700, color:C.faint, letterSpacing:0.8, background:C.elevated, borderBottom:`1px solid ${C.border}` }}>
-                {["日期","交易员","类型","状态","金额","余额","备注",""].map(h=><div key={h}>{h}</div>)}
+                {["操作日期","交易员","类型","状态","金额","余额","备注",""].map(h=><div key={h}>{h}</div>)}
               </div>
               {ledger.length===0&&<div style={{padding:"28px",fontSize:14,color:C.faint,textAlign:"center"}}>暂无记录</div>}
               {ledger.slice(ledgerPage*LEDGER_PAGE_SIZE,(ledgerPage+1)*LEDGER_PAGE_SIZE).map((e:any,i:number)=>{
                 const pos=e.amount_usd>0; const col=pos?C.green:C.red;
+                // 判断某个 period (e.g. "2026-03") 是否被发放记录覆盖
+                // period_covered 支持两种格式: "2026.01-2026.03"(范围) 或 "2026-01,2026-03"(逗号列表)
+                const isPeriodCovered = (period: string, covered: string): boolean => {
+                  for (const part of covered.split(",").map(s => s.trim())) {
+                    const rangeMatch = part.match(/^(\d{4})[.\-](\d{2})[- ](\d{4})[.\-](\d{2})$/);
+                    if (rangeMatch) {
+                      const start = `${rangeMatch[1]}-${rangeMatch[2]}`;
+                      const end   = `${rangeMatch[3]}-${rangeMatch[4]}`;
+                      if (period >= start && period <= end) return true;
+                    }
+                    // 也兼容直接匹配（逗号列表中每项可能是 "2026-03" 或 "2026.03"）
+                    if (part.replace(".", "-") === period) return true;
+                  }
+                  return false;
+                };
                 const commStatus = e.type==="commission" ? (
                   payouts.some((p:any) => p.trader_id===e.trader_id &&
-                    (p.period_covered||"").split(",").map((x:string)=>x.trim()).includes(e.period))
+                    isPeriodCovered(e.period, p.period_covered||""))
                     ? { lbl:"已发放", clr:C.green } : { lbl:"计提", clr:C.warn }
                 ) : null;
                 return (
                   <div key={e.id} style={{display:"grid",gridTemplateColumns:"110px 100px 80px 90px 120px 120px 1fr 34px",padding:"12px 24px",gap:12,borderBottom:`1px solid ${C.border}`,background:i%2?`${C.elevated}60`:"transparent",alignItems:"center"}}>
-                    <div style={{fontSize:13,color:C.muted}}>{e.entry_date}</div>
+                    <div style={{fontSize:12,color:C.muted,lineHeight:1.4}}>
+                      {e.type==="commission"||e.type==="deduct"
+                        ? e.created_at
+                          ? <><div>{new Date(e.created_at).toLocaleDateString("zh-CN",{year:"numeric",month:"2-digit",day:"2-digit"}).replace(/\//g,"-")}</div><div style={{fontSize:11,color:C.faint}}>{new Date(e.created_at).toLocaleTimeString("zh-CN",{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false})}</div></>
+                          : e.entry_date
+                        : e.entry_date}
+                    </div>
                     <div style={{fontSize:14,fontWeight:600}}>{TRADERS[e.trader_id]?.name}</div>
                     <span style={tag(col)}>{e.type}</span>
                     <div>{commStatus ? <span style={{fontSize:11,padding:"2px 8px",borderRadius:10,fontWeight:700,background:`${commStatus.clr}22`,color:commStatus.clr}}>{commStatus.lbl}</span> : <span style={{color:C.faint}}>—</span>}</div>
@@ -1137,8 +1303,8 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                           {(() => {
                             const dbRec = commissions.find((c:any) => c.trader_id===r.trader_id && c.period===period);
                             const hasPayout = payouts.some((p:any) => p.trader_id===r.trader_id && p.period_covered?.includes(period));
-                            const lbl = hasPayout ? "已发放" : dbRec?.status==="confirmed" ? "业绩已确认" : "待确认";
-                            const clr = hasPayout ? C.green : dbRec?.status==="confirmed" ? C.warn : C.muted;
+                            const lbl = hasPayout ? "已发放" : dbRec?.status==="confirmed" ? "已核对" : "待确认";
+                            const clr = hasPayout ? C.green : dbRec?.status==="confirmed" ? C.green : C.warn;
                             return (
                               <span style={{ fontSize:11, padding:"2px 10px", borderRadius:20, fontWeight:700, background:`${clr}22`, color:clr }}>
                                 {lbl}
@@ -1242,14 +1408,38 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
         {/* ══ SETTLEMENT ══ */}
         {tab === "settlement" && settlView === "list" && (
           <div>
-            {/* Email notifications panel */}
-            <EmailNotifications C={C} font={font} onCount={setEmailCount} />
-
             {/* ── Monthly Profit Summary + ERP Ledger ── */}
             {(() => {
               // ── 利润计算（简单公式）──
+              const sortedPfAll = [...periodFeesAll].sort((a:any,b:any)=>b.period.localeCompare(a.period));
               const profitRows = settlements.filter((s: any) => s.period >= "2026-01").map((s: any) => {
-                const postUsd  = s.post_exchange_usd != null ? parseFloat(s.post_exchange_usd) : null;
+                // Priority 1: payment_exchange USD to_amount sum（手动补录或PDF解析的最终确认值）
+                const peUsdTotal = (s.payment_exchange ?? [])
+                  .filter((r:any) => r.to_ccy === "USD" && parseFloat(r.to_amount || 0) > 0)
+                  .reduce((sum:number, r:any) => sum + parseFloat(r.to_amount || 0), 0);
+                // Priority 2: post_exchange_usd（PDF 原始字段）
+                let postUsd: number | null = peUsdTotal > 0 ? peUsdTotal
+                  : s.post_exchange_usd != null ? parseFloat(s.post_exchange_usd)
+                  : null;
+                let postUsdSource: "pe" | "pdf" | "est" = peUsdTotal > 0 ? "pe"
+                  : (s.post_exchange_usd != null && parseFloat(s.post_exchange_usd) > 0) ? "pdf"
+                  : "est";
+                // Priority 3: post_exchange_aud × fxAud（4月类型：PDF 里 AUD 尚未换汇）
+                if (!postUsd || postUsd === 0) {
+                  const pf = sortedPfAll.find((p:any) => p.period === s.period);
+                  const fxAud = pf ? parseFloat(pf.fx_aud_usd || 0) : 0;
+                  if (fxAud > 0) {
+                    const peAud = s.post_exchange_aud != null ? parseFloat(s.post_exchange_aud) : 0;
+                    if (peAud > 0) {
+                      postUsd = Math.round(peAud * fxAud * 100) / 100; postUsdSource = "est";
+                    } else {
+                      // 最终兜底：用 Grand Total AUD（equity - expenses 近似）
+                      const audUsedInLc = (s.loss_coverage ?? []).filter((r:any)=>r.from_ccy==="AUD").reduce((sum:number,r:any)=>sum+(r.from_amount||0),0);
+                      const postExchAud = Math.max(0, (s.equity_aud||0) - audUsedInLc);
+                      if (postExchAud > 0) { postUsd = Math.round(postExchAud * fxAud * 100) / 100; postUsdSource = "est"; }
+                    }
+                  }
+                }
                 const wireFees = parseFloat(s.wire_fees_usd ?? "0");
                 const periodComms = commissions.filter((c:any) => c.period === s.period);
                 const monthlyComm = periodComms.reduce((sum:number, c:any) => {
@@ -1266,7 +1456,7 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                 const roomProfit  = postUsd != null
                   ? Math.round((postUsd - monthlyComm - wireFees) * 10000) / 10000
                   : null;
-                return { period: s.period, postUsd, wireFees, monthlyComm, roomProfit, s };
+                return { period: s.period, postUsd, postUsdSource, wireFees, monthlyComm, roomProfit, s };
               });
               const totalProfit = profitRows.reduce((sum, r) => sum + (r.roomProfit ?? 0), 0);
               const hasAnyProfit = profitRows.some(r => r.roomProfit != null);
@@ -1307,10 +1497,21 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                       const col = r.roomProfit == null ? C.faint : pos ? C.green : C.red;
                       return (
                         <div key={r.period}
-                          onClick={()=>{ setSForm({ period:r.s.period, equity_aud:r.s.equity_aud?.toString()??"", cut_aud:r.s.cut_aud?.toString()??"", net_aud:r.s.net_aud?.toString()??"", exe_aud:r.s.exe_aud?.toString()??"", equity_hkd:r.s.equity_hkd?.toString()??"", cut_hkd:r.s.cut_hkd?.toString()??"", net_hkd:r.s.net_hkd?.toString()??"", exe_hkd:r.s.exe_hkd?.toString()??"", post_exchange_usd:r.s.post_exchange_usd?.toString()??"", wire_fees_usd:r.s.wire_fees_usd?.toString()??"", fx_notes:r.s.fx_notes??"", loss_coverage:r.s.loss_coverage??[], payment_exchange:r.s.payment_exchange??[], erp_deposits:r.s.erp_deposits??[], erp_withdrawals:r.s.erp_withdrawals??[] }); setSettlView("edit"); }}
+                          onClick={()=>{ setSForm({ period:r.s.period, equity_aud:r.s.equity_aud?.toString()??"", cut_aud:r.s.cut_aud?.toString()??"", net_aud:r.s.net_aud?.toString()??"", exe_aud:r.s.exe_aud?.toString()??"", equity_hkd:r.s.equity_hkd?.toString()??"", cut_hkd:r.s.cut_hkd?.toString()??"", net_hkd:r.s.net_hkd?.toString()??"", exe_hkd:r.s.exe_hkd?.toString()??"", post_exchange_aud:r.s.post_exchange_aud?.toString()??"", post_exchange_hkd:r.s.post_exchange_hkd?.toString()??"", post_exchange_usd:r.s.post_exchange_usd?.toString()??"", wire_fees_usd:r.s.wire_fees_usd?.toString()??"", fx_notes:r.s.fx_notes??"", loss_coverage:r.s.loss_coverage??[], payment_exchange:r.s.payment_exchange??[], erp_deposits:r.s.erp_deposits??[], erp_withdrawals:r.s.erp_withdrawals??[] }); setSettlView("edit"); }}
                           style={{display:"grid", gridTemplateColumns:"80px 1fr 90px 110px 110px", padding:"12px 20px", gap:10, borderBottom:`1px solid ${C.border}`, background:i%2?`${C.elevated}60`:"transparent", alignItems:"center", cursor:"pointer", fontSize:13}}>
                           <div style={{fontWeight:700}}>{r.period}</div>
-                          <div style={{color:C.muted}}>{r.postUsd!=null?`$${f2(r.postUsd)}`:"—"}</div>
+                          <div style={{color:C.muted}}>
+                            {r.postUsd!=null ? (
+                              <span>
+                                ${f2(r.postUsd)}
+                                {r.postUsdSource === "pe"
+                                  ? <span style={{fontSize:10,color:C.blue,marginLeft:4}}>⚡兑换确认</span>
+                                  : r.postUsdSource === "est"
+                                    ? <span style={{fontSize:10,color:C.warn,marginLeft:4}}>~AUD换算</span>
+                                    : null}
+                              </span>
+                            ) : "—"}
+                          </div>
                           <div style={{color:C.red, fontSize:12}}>{r.wireFees>0?`-$${f2(r.wireFees)}`:"—"}</div>
                           <div style={{fontSize:12}}>
                             <span style={{color:C.blue}}>{r.monthlyComm!==0?`-$${f2(r.monthlyComm)}`:"—"}</span>
@@ -1389,29 +1590,170 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
               );
             })()}
 
-            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
-              <div style={{ fontSize:15, fontWeight:600, color:C.muted }}>Settlement 原始记录</div>
-              <button onClick={() => { setSForm({...emptySForm, period}); setSettlView("edit"); }} style={filledBtn()}>+ 新建 / 上传</button>
-            </div>
-            {settlements.length===0 && <div style={{...card, textAlign:"center", color:C.faint, fontSize:14, padding:"48px"}}>暂无记录</div>}
-            {settlements.map((s:any)=>(
-              <div key={s.period} style={{...card, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"space-between"}}
-                onClick={()=>{
-                  setSForm({ period:s.period, equity_aud:s.equity_aud?.toString()??"", cut_aud:s.cut_aud?.toString()??"", net_aud:s.net_aud?.toString()??"", exe_aud:s.exe_aud?.toString()??"", equity_hkd:s.equity_hkd?.toString()??"", cut_hkd:s.cut_hkd?.toString()??"", net_hkd:s.net_hkd?.toString()??"", exe_hkd:s.exe_hkd?.toString()??"", post_exchange_usd:s.post_exchange_usd?.toString()??"", wire_fees_usd:s.wire_fees_usd?.toString()??"", fx_notes:s.fx_notes??"", loss_coverage:s.loss_coverage??[], payment_exchange:s.payment_exchange??[], erp_deposits:s.erp_deposits??[], erp_withdrawals:s.erp_withdrawals??[] });
-                  setSettlView("edit");
-                }}>
-                <div>
-                  <div style={{ fontSize:16, fontWeight:700, marginBottom:6 }}>{s.period}</div>
-                  <div style={{ fontSize:13, color:C.muted, display:"flex", gap:20 }}>
-                    <span>AUD Equity: {s.equity_aud!=null?f2(s.equity_aud):"—"}</span>
-                    <span>HKD Equity: {s.equity_hkd!=null?f2(Math.abs(s.equity_hkd)):"—"}</span>
-                    <span>Post Exchange: {s.post_exchange_usd!=null?`$${f2(s.post_exchange_usd)}`:"—"}</span>
-                    {s.payment_exchange?.length>0&&<span style={{color:C.blue}}>⚡ 含兑换汇率</span>}
+            {/* ── 左右分栏：Settlement 列表 1/3 + 交易数据 2/3 ── */}
+            <div style={{ display:"flex", gap:16, alignItems:"flex-start" }}>
+
+              {/* 左：Settlement 月份列表 */}
+              <div style={{ flex:"0 0 23%", minWidth:0 }}>
+                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12, gap:8 }}>
+                  <div style={{ fontSize:14, fontWeight:600, color:C.muted, flexShrink:0 }}>Settlement 记录</div>
+                  <div style={{ display:"flex", gap:6, alignItems:"center", flexWrap:"wrap" as const }}>
+                    <select value={period} onChange={e => setPeriod(e.target.value)} style={{ ...inp, width:110, padding:"5px 10px", fontSize:13 }}>
+                      {MONTHS.map(p => <option key={p}>{p}</option>)}
+                    </select>
+                    <input type="file" accept=".pdf" ref={settlPdfRef} onChange={handlePdfUpload} style={{ display:"none" }} />
+                    <input type="file" accept="image/*" ref={settlImgRef} onChange={e => { handleImgUpload(e); setSForm({...emptySForm, period}); setSettlView("edit"); }} style={{ display:"none" }} />
+                    <button onClick={() => { setSForm({...emptySForm, period}); settlPdfRef.current?.click(); }} style={{...ghostBtn(), fontSize:12, padding:"5px 9px"}} disabled={pdfParsing}>
+                      {pdfParsing ? "解析…" : "↑ PDF"}
+                    </button>
+                    <button onClick={() => { setSForm({...emptySForm, period}); settlImgRef.current?.click(); }} style={{...ghostBtn(), fontSize:12, padding:"5px 9px"}}>
+                      🖼 截图
+                    </button>
+                    <button onClick={triggerSettlFetch} style={{...ghostBtn(), fontSize:12, padding:"5px 9px"}} disabled={fetchingSettl}>
+                      {fetchingSettl ? "抓取…" : "↓ 抓取"}
+                    </button>
+                    <button onClick={() => { setSForm({...emptySForm, period}); setSettlView("edit"); }} style={{...ghostBtn(), fontSize:12, padding:"5px 9px", whiteSpace:"nowrap"}}>+ 新建</button>
                   </div>
                 </div>
-                <span style={{ color:C.muted, fontSize:20 }}>›</span>
+                {settlements.length===0 && <div style={{...card, textAlign:"center", color:C.faint, fontSize:13, padding:"32px"}}>暂无记录</div>}
+                {settlements.map((s:any) => {
+                  const isSelected = selectedSettlPeriod === s.period;
+                  return (
+                    <div key={s.period}
+                      style={{ ...card, cursor:"pointer", marginBottom:8, padding:"12px 16px",
+                        borderColor: isSelected ? C.blue : C.border,
+                        borderLeft: `3px solid ${isSelected ? C.blue : "transparent"}`,
+                        background: isSelected ? `${C.blue}10` : C.surface }}
+                      onClick={() => setSelectedSettlPeriod(isSelected ? null : s.period)}>
+                      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                        <div style={{ fontSize:15, fontWeight:700 }}>{s.period}</div>
+                        <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+                          {s.payment_exchange?.length>0 && <span style={{fontSize:10, color:C.blue}}>⚡汇率</span>}
+                          <button onClick={e => { e.stopPropagation();
+                            setSForm({ period:s.period, equity_aud:s.equity_aud?.toString()??"", cut_aud:s.cut_aud?.toString()??"", net_aud:s.net_aud?.toString()??"", exe_aud:s.exe_aud?.toString()??"", equity_hkd:s.equity_hkd?.toString()??"", cut_hkd:s.cut_hkd?.toString()??"", net_hkd:s.net_hkd?.toString()??"", exe_hkd:s.exe_hkd?.toString()??"", post_exchange_aud:s.post_exchange_aud?.toString()??"", post_exchange_hkd:s.post_exchange_hkd?.toString()??"", post_exchange_usd:s.post_exchange_usd?.toString()??"", wire_fees_usd:s.wire_fees_usd?.toString()??"", fx_notes:s.fx_notes??"", loss_coverage:s.loss_coverage??[], payment_exchange:s.payment_exchange??[], erp_deposits:s.erp_deposits??[], erp_withdrawals:s.erp_withdrawals??[] });
+                            setSettlView("edit");
+                          }} style={{...ghostBtn(), fontSize:11, padding:"3px 8px"}}>编辑</button>
+                        </div>
+                      </div>
+                      <div style={{ fontSize:11, color:C.faint, marginTop:4, display:"flex", gap:12, flexWrap:"wrap" as const }}>
+                        <span>AUD {s.equity_aud!=null?f2(s.equity_aud):"—"}</span>
+                        <span>HKD {s.equity_hkd!=null?f2(Math.abs(s.equity_hkd)):"—"}</span>
+                        {(() => {
+                          const peTot = (s.payment_exchange ?? []).filter((r:any) => r.to_ccy==="USD" && parseFloat(r.to_amount||0)>0).reduce((sum:number,r:any)=>sum+parseFloat(r.to_amount||0),0);
+                          const dispUsd = peTot > 0 ? peTot : (s.post_exchange_usd != null ? parseFloat(s.post_exchange_usd) : null);
+                          return <span>Post {dispUsd!=null?`$${f2(dispUsd)}`:"—"}{peTot>0?<span style={{fontSize:9,color:C.blue,marginLeft:2}}>⚡</span>:null}</span>;
+                        })()}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
-            ))}
+
+              {/* 右：已上传交易数据 */}
+              <div style={{ flex:1, minWidth:0 }}>
+                {!selectedSettlPeriod ? (
+                  <div style={{ ...card, textAlign:"center", color:C.faint, fontSize:13, padding:"60px 24px" }}>
+                    ← 点击左侧月份查看交易数据
+                  </div>
+                ) : (() => {
+                  const sp = selectedSettlPeriod;
+                  const spTrades = tradeRecords.filter((r:any) => r.period === sp);
+                  const spComms  = commissions.filter((c:any) => c.period === sp);
+                  const isConfirmedPeriod = spComms.some((c:any) => c.status === "confirmed");
+                  const sortedPfSp = [...periodFeesAll].sort((a:any,b:any) => b.period.localeCompare(a.period));
+                  const pfSp = sortedPfSp.find((p:any) => p.period <= sp && (parseFloat(p.fx_aud_usd||0)>0));
+                  const fxSp = pfSp ? parseFloat(pfSp.fx_aud_usd) : 0;
+
+                  return (
+                    <div>
+                      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12 }}>
+                        <div style={{ fontSize:14, fontWeight:600 }}>
+                          {sp} 交易数据
+                          <span style={{ marginLeft:8, fontSize:11, padding:"2px 8px", borderRadius:10,
+                            background: isConfirmedPeriod ? `${C.green}22` : `${C.warn}22`,
+                            color: isConfirmedPeriod ? C.green : C.warn, fontWeight:700 }}>
+                            {isConfirmedPeriod ? "已核对" : "待确认"}
+                          </span>
+                        </div>
+                        {/* 一键结算按钮 */}
+                        {!isConfirmedPeriod && (
+                          <button
+                            style={{ ...filledBtn(C.blue), fontSize:13, display:"flex", alignItems:"center", gap:6 }}
+                            disabled={settling}
+                            onClick={async () => {
+                              setSettling(true);
+                              showToast(`正在下载 ${sp} 结算数据...`);
+                              try {
+                                // 下载 PDF
+                                const pdfUrl = `https://metro.dttw.com/metro/download-past-settlement-pdf/1232/${sp}`;
+                                const resp = await fetch(pdfUrl, { credentials: "include" });
+                                if (!resp.ok) throw new Error("PDF 下载失败，请确认已在 DTTW 完成结算操作");
+                                const blob = await resp.blob();
+                                const file = new File([blob], `settlement-${sp}.pdf`, { type:"application/pdf" });
+                                const parsed = await parsePdf(file);
+                                const parsedPe = parsed.payment_exchange ?? [];
+                                const savedPe = settlements.find((s:any) => s.period === sp)?.payment_exchange ?? [];
+                                const currentPe = hasPaymentExchange(savedPe) ? savedPe : ((sForm.period || period) === sp ? sForm.payment_exchange ?? [] : []);
+                                const peDiff = paymentExchangeDiffers(currentPe, parsedPe);
+                                setSForm((prev:any) => {
+                                  const prevPe = (prev.period || period) === sp ? prev.payment_exchange : [];
+                                  const finalPe = hasPaymentExchange(savedPe) ? savedPe : (hasPaymentExchange(prevPe) ? prevPe : parsedPe);
+                                  return { period:sp, equity_aud:parsed.equity_aud?.toString()??"", cut_aud:parsed.cut_aud?.toString()??"", net_aud:parsed.net_aud?.toString()??"", exe_aud:parsed.exe_aud?.toString()??"", equity_hkd:parsed.equity_hkd?.toString()??"", cut_hkd:parsed.cut_hkd?.toString()??"", net_hkd:parsed.net_hkd?.toString()??"", exe_hkd:parsed.exe_hkd?.toString()??"", post_exchange_usd:parsed.post_exchange_usd?.toString()??"", wire_fees_usd:parsed.wire_fees_usd?.toString()??"", fx_notes:"", loss_coverage:parsed.loss_coverage??[], payment_exchange:finalPe, erp_deposits:parsed.erp_deposits??[], erp_withdrawals:parsed.erp_withdrawals??[] };
+                                });
+                                setSettlView("edit");
+                                showToast(peDiff ? "PDF Payment Exchange 与当前已确认值不同，已保留当前值" : "PDF 解析完成，请核对后保存");
+                              } catch(e:any) {
+                                showToast(e.message || "结算失败", false);
+                              }
+                              setSettling(false);
+                            }}>
+                            {settling ? "处理中..." : `⚡ 一键结算 ${sp}`}
+                          </button>
+                        )}
+                      </div>
+
+                      {spTrades.length === 0 ? (
+                        <div style={{ ...card, textAlign:"center", color:C.faint, fontSize:13, padding:"40px" }}>
+                          该月暂无已上传 CSV 数据
+                        </div>
+                      ) : (
+                        <div style={{ ...card, padding:0, overflow:"hidden" }}>
+                          <div style={{ overflowX:"auto" }}>
+                            <div style={{ minWidth:1000, display:"grid", gridTemplateColumns:"90px 70px 90px 110px 110px 100px 160px 100px 120px", padding:"8px 16px", gap:8, fontSize:11, fontWeight:700, color:C.faint, letterSpacing:0.8, background:C.elevated, borderBottom:`1px solid ${C.border}` }}>
+                              {["交易员","状态","Gross","Gateway","NET","Exe Fee","Entitlements","Office Fee","业绩提成(预算)"].map(h=><div key={h}>{h}</div>)}
+                            </div>
+                            {spTrades.map((r:any, i:number) => {
+                              const cfg = TRADERS[r.trader_id];
+                              const net = (r.gross||0)-(r.gateway_charge||0);
+                              const comm = spComms.find((c:any) => c.trader_id === r.trader_id);
+                              const isConf = comm?.status === "confirmed";
+                              const estComm = comm?.monthly_usd != null ? parseFloat(comm.monthly_usd) : null;
+                              const entLabel = r.trader_id === "LULUSHI" ? "HKE 451.70 HKD" : "ASX 132.22 AUD\nCHIXA 64.50 USD";
+                              const officeLabel = cfg?.ccy === "AUD" ? "75.00 USD" : "—";
+                              return (
+                                <div key={r.id||i} style={{ minWidth:1000, display:"grid", gridTemplateColumns:"90px 70px 110px 110px 110px 100px 160px 100px 120px", padding:"10px 16px", gap:8, borderBottom:`1px solid ${C.border}`, background:i%2?`${C.elevated}60`:"transparent", fontSize:13, alignItems:"center" }}>
+                                  <div style={{ fontWeight:600 }}>{cfg?.name||r.trader_id}</div>
+                                  <span style={{ fontSize:10, padding:"2px 6px", borderRadius:8, fontWeight:700, background:isConf?`${C.green}22`:`${C.warn}22`, color:isConf?C.green:C.warn }}>{isConf?"已核对":"待确认"}</span>
+                                  <div style={{ color:(r.gross||0)>=0?C.green:C.red }}>{(r.gross||0).toFixed(2)}</div>
+                                  <div style={{ color:C.red }}>{r.gateway_charge!=null?`-${r.gateway_charge.toFixed(2)}`:"—"}</div>
+                                  <div style={{ fontWeight:600, color:net>=0?C.green:C.red }}>{net.toFixed(2)}</div>
+                                  <div style={{ color:C.red }}>{r.exe_fee!=null?`-${r.exe_fee.toFixed(2)}`:"—"}</div>
+                                  <div style={{ color:C.warn, fontSize:11, whiteSpace:"pre-line" as const }}>{entLabel}</div>
+                                  <div style={{ color:C.warn }}>{officeLabel}</div>
+                                  <div style={{ fontWeight:700, color:estComm==null?C.faint:estComm>=0?C.green:C.red }}>
+                                    {estComm==null?"—":`${estComm>=0?"+":"-"}$${f2(Math.abs(estComm))}`}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
+            </div>
           </div>
         )}
 
@@ -1422,8 +1764,8 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
               <div style={{ fontSize:17, fontWeight:700 }}>{sForm.period||period} Settlement</div>
             </div>
 
-            {/* Structural Profit Analysis */}
-            {(() => {
+            {/* Structural Profit Analysis — removed per user request */}
+            {false && (() => {
               const p = sForm.period || period;
               const periodTrades = tradeRecords.filter((r:any) => r.period === p);
 
@@ -1576,11 +1918,20 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                 ))}
               </div>
               <div style={secHead}>汇总</div>
-              <div style={grid("1fr 1fr 1fr")}>
-                {[["Post Exchange Total (USD)","post_exchange_usd"],["Wire Fees (USD)","wire_fees_usd"]].map(([l,k])=>(
-                  <div key={k as string}><label style={lbl}>{l}</label>
-                    <input type="number" step="0.01" style={inp} value={sForm[k as string]} onChange={e=>setSForm((p:any)=>({...p,[k as string]:e.target.value}))} /></div>
-                ))}
+              <div style={{marginBottom:8}}>
+                <label style={{...lbl,marginBottom:6}}>Post Exchange Total（PDF 原始三栏，只读）</label>
+                <div style={{...grid("1fr 1fr 1fr"),gap:8}}>
+                  {[["AUD","post_exchange_aud"],["HKD","post_exchange_hkd"],["USD","post_exchange_usd"]].map(([ccy,k])=>(
+                    <div key={k as string}>
+                      <label style={{...lbl,fontSize:11}}>{ccy}</label>
+                      <input type="number" step="0.01" style={{...inp,background:"#0a1828",cursor:"default"}} readOnly value={sForm[k as string]} onChange={e=>setSForm((p:any)=>({...p,[k as string]:e.target.value}))} />
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div style={grid("1fr 1fr")}>
+                <div><label style={lbl}>Wire Fees (USD)</label>
+                  <input type="number" step="0.01" style={inp} value={sForm.wire_fees_usd} onChange={e=>setSForm((p:any)=>({...p,wire_fees_usd:e.target.value}))} /></div>
                 <div><label style={lbl}>FX 备注</label><input type="text" style={inp} value={sForm.fx_notes} onChange={e=>setSForm((p:any)=>({...p,fx_notes:e.target.value}))} /></div>
               </div>
             </div>
@@ -1615,19 +1966,30 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                 <button onClick={()=>setSForm((p:any)=>({...p,payment_exchange:[...p.payment_exchange,{from_ccy:"AUD",from_amount:"",to_ccy:"USD",to_amount:"",rate:""}]}))} style={ghostBtn()}>+ 添加</button>
               </div>
               {sForm.payment_exchange.length===0&&<div style={{fontSize:13,color:C.faint}}>本月无</div>}
-              {sForm.payment_exchange.map((row:any,i:number)=>(
+              {sForm.payment_exchange.map((row:any,i:number)=>{
+                const syncRate = (a: any[], idx: number) => {
+                  const from = parseFloat(a[idx].from_amount);
+                  const to   = parseFloat(a[idx].to_amount);
+                  if (from > 0 && to > 0) {
+                    a[idx].rate = (to / from).toFixed(8);
+                    if (a[idx].from_ccy==="AUD"&&a[idx].to_ccy==="USD") setFForm((f:any)=>({...f,fx_aud_usd:a[idx].rate}));
+                    if (a[idx].from_ccy==="HKD"&&a[idx].to_ccy==="USD") setFForm((f:any)=>({...f,fx_hkd_usd:a[idx].rate}));
+                  }
+                };
+                return (
                 <div key={i} style={{...grid("80px 1fr 24px 80px 1fr 1fr 30px"),alignItems:"end",marginBottom:10}}>
                   {[
                     {l:"从",el:<select style={inp} value={row.from_ccy} onChange={e=>{const a=[...sForm.payment_exchange];a[i]={...a[i],from_ccy:e.target.value};setSForm((p:any)=>({...p,payment_exchange:a}))}}><option>AUD</option><option>HKD</option><option>USD</option></select>},
-                    {l:"金额",el:<input type="number" style={inp} value={row.from_amount} onChange={e=>{const a=[...sForm.payment_exchange];a[i]={...a[i],from_amount:e.target.value};setSForm((p:any)=>({...p,payment_exchange:a}))}} />},
+                    {l:"金额",el:<input type="number" style={inp} value={row.from_amount} onChange={e=>{const a=[...sForm.payment_exchange];a[i]={...a[i],from_amount:e.target.value};syncRate(a,i);setSForm((p:any)=>({...p,payment_exchange:a}))}} />},
                     {l:"",el:<div style={{textAlign:"center",paddingBottom:10,color:C.muted}}>→</div>},
                     {l:"到",el:<select style={inp} value={row.to_ccy} onChange={e=>{const a=[...sForm.payment_exchange];a[i]={...a[i],to_ccy:e.target.value};setSForm((p:any)=>({...p,payment_exchange:a}))}}><option>USD</option><option>HKD</option><option>AUD</option></select>},
-                    {l:"金额",el:<input type="number" style={inp} value={row.to_amount} onChange={e=>{const a=[...sForm.payment_exchange];a[i]={...a[i],to_amount:e.target.value};setSForm((p:any)=>({...p,payment_exchange:a}))}} />},
-                    {l:"汇率",el:<input type="number" step="0.000001" style={{...inp,borderColor:C.blue+"60"}} value={row.rate} onChange={e=>{const a=[...sForm.payment_exchange];a[i]={...a[i],rate:e.target.value};setSForm((p:any)=>({...p,payment_exchange:a}));if(row.from_ccy==="AUD"&&row.to_ccy==="USD")setFForm((f:any)=>({...f,fx_aud_usd:e.target.value}));if(row.from_ccy==="HKD"&&row.to_ccy==="USD")setFForm((f:any)=>({...f,fx_hkd_usd:e.target.value}))}} />},
+                    {l:"金额",el:<input type="number" style={inp} value={row.to_amount} onChange={e=>{const a=[...sForm.payment_exchange];a[i]={...a[i],to_amount:e.target.value};syncRate(a,i);setSForm((p:any)=>({...p,payment_exchange:a}))}} />},
+                    {l:"汇率（自动）",el:<input type="number" step="0.000001" style={{...inp,borderColor:C.blue+"60"}} value={row.rate} onChange={e=>{const a=[...sForm.payment_exchange];a[i]={...a[i],rate:e.target.value};setSForm((p:any)=>({...p,payment_exchange:a}));if(row.from_ccy==="AUD"&&row.to_ccy==="USD")setFForm((f:any)=>({...f,fx_aud_usd:e.target.value}));if(row.from_ccy==="HKD"&&row.to_ccy==="USD")setFForm((f:any)=>({...f,fx_hkd_usd:e.target.value}))}} />},
                     {l:"",el:<button onClick={()=>{const a=sForm.payment_exchange.filter((_:any,j:number)=>j!==i);setSForm((p:any)=>({...p,payment_exchange:a}))}} style={{...ghostBtn(),padding:"8px"}}>×</button>},
                   ].map(({l,el},j)=><div key={j}>{l&&<label style={lbl}>{l}</label>}{el}</div>)}
                 </div>
-              ))}
+                );
+              })}
             </div>
             {/* ERP */}
             <div style={card}>
@@ -1885,24 +2247,56 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
           const curMonth = new Date().toISOString().slice(0, 7);
           // FX helper: use latest available confirmed rate, else rough fallback
           const sortedPf0 = [...periodFeesAll].sort((a: any, b: any) => b.period.localeCompare(a.period));
-          const getFx = (ccy: string): { rate: number; src: string } => {
+          const getFx = (ccy: string, month?: string): { rate: number; src: string } => {
             if (ccy === "AUD") {
-              const pf = sortedPf0.find((p: any) => parseFloat(p.fx_aud_usd) > 0);
+              const pf = sortedPf0.find((p: any) => (!month || p.period <= month) && parseFloat(p.fx_aud_usd) > 0);
               return pf ? { rate: parseFloat(pf.fx_aud_usd), src: pf.period } : { rate: 0.63, src: "~估" };
             }
             if (ccy === "HKD") {
-              const pf = sortedPf0.find((p: any) => parseFloat(p.fx_hkd_usd) > 0);
+              const pf = sortedPf0.find((p: any) => (!month || p.period <= month) && parseFloat(p.fx_hkd_usd) > 0);
               return pf ? { rate: parseFloat(pf.fx_hkd_usd), src: pf.period } : { rate: 0.13, src: "~估" };
             }
             return { rate: 1, src: "" };
           };
 
-          // Filtered detail rows（已按月加载，再按交易员筛选）
+          // Filtered detail rows（按交易员 + 日期范围筛选）
           const filtered = dailyPerf.filter(r =>
-            dailyFilter.trader === "All" || r.trader_name === dailyFilter.trader
+            (dailyFilter.trader === "All" || r.trader_name === dailyFilter.trader) &&
+            r.trade_date >= dailyFilter.dateFrom &&
+            r.trade_date <= dailyFilter.dateTo
           );
           const totalPages  = Math.ceil(filtered.length / DAILY_PAGE_SIZE);
           const pagedRows   = filtered.slice(dailyPage * DAILY_PAGE_SIZE, (dailyPage + 1) * DAILY_PAGE_SIZE);
+
+          // Previous month string
+          const prevMonthDate = new Date();
+          prevMonthDate.setMonth(prevMonthDate.getMonth() - 1);
+          const prevMonth = prevMonthDate.toISOString().slice(0, 7);
+
+          // Helper: is a month confirmed in commission_results?
+          const isConfirmed = (month: string) =>
+            commissions.some((c: any) => c.period === month && c.status === "confirmed");
+
+          // Helper: calc MTD for a trader + month from overviewPerf
+          const calcMtd = (id: string, month: string, fx: number, ccy: string) => {
+            const rows = overviewPerf.filter(r => r.trader_name === id && r.trade_date.startsWith(month));
+            const net  = rows.reduce((s, r) => s + (parseFloat(r.trading_total) || 0), 0);
+            const exe  = rows.reduce((s, r) => s + (parseFloat(r.exe_fee) || 0), 0);
+            const days = new Set(rows.map(r => r.trade_date)).size;
+            const usd  = net * fx;
+            const pf   = sortedPf0.find((p: any) => p.period <= month && (ccy === "AUD" ? parseFloat(p.fx_aud_usd || 0) > 0 : parseFloat(p.fx_hkd_usd || 0) > 0));
+            let rawEst: number;
+            if (ccy === "AUD") {
+              const asx   = pf ? parseFloat(pf.asx_aud ?? 264.44) / 2 : 132.22;
+              const chixa = pf ? parseFloat(pf.chixa_usd ?? 129.0) / 2 : 64.50;
+              rawEst = fx ? (net * 0.80 - exe - asx - chixa / fx) * fx - 75 : 0;
+            } else {
+              const hke = pf ? parseFloat(pf.hke_hkd ?? 451.70) : 451.70;
+              rawEst = fx ? (net - exe - hke) * fx : 0;
+            }
+            const commEst = rawEst;
+            return { net, days, usd, commEst };
+          };
 
           // Build per-trader card data (fusing balance + recent perf)
           const traderCards = Object.entries(TRADERS).map(([id, cfg]) => {
@@ -1914,100 +2308,111 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
             const statusColor = !b || bal <= 0 ? C.red : bal < reserve / 2 ? C.red : bal < reserve ? C.warn : C.green;
             const statusLabel = !b || bal <= 0 ? "🚨 必须充值" : bal < reserve / 2 ? "⚠ 严重不足" : bal < reserve ? "⚠ 低于留存" : "✓ 正常";
 
+            const { rate: curFx, src: curFxSrc } = getFx(cfg.ccy, curMonth);
+            const { rate: prevFx } = getFx(cfg.ccy, prevMonth);
+            const cur  = calcMtd(id, curMonth,  curFx, cfg.ccy);
+            const prev = calcMtd(id, prevMonth, prevFx, cfg.ccy);
+            // 预估月末余额 = 已确认余额 + 草稿提成 + 无结算记录月份估算
+            const hasTradeRecordForMonth = (month: string) =>
+              tradeRecords.some((r: any) => r.trader_id === id && r.period === month);
+            const parseDraftMonthlyUsd = (c: any): number | null => {
+              if (c.monthly_usd === null || c.monthly_usd === undefined || c.monthly_usd === "") return null;
+              const value = parseFloat(c.monthly_usd);
+              return Number.isFinite(value) ? value : null;
+            };
+            const isEffectiveCommission = (c: any) =>
+              c.trader_id === id &&
+              (c.status === "confirmed" ||
+                (c.status === "draft" && parseDraftMonthlyUsd(c) !== null && hasTradeRecordForMonth(c.period)));
+            const allDraftUsdId = commissions
+              .filter((c: any) => c.trader_id === id && c.status === "draft" && isEffectiveCommission(c))
+              .reduce((sum: number, c: any) => sum + (parseDraftMonthlyUsd(c) ?? 0), 0);
+            const commPeriodsForId = new Set(commissions.filter(isEffectiveCommission).map((c: any) => c.period));
+            const unconfEst = [curMonth, prevMonth]
+              .filter(m => !commPeriodsForId.has(m) && (m === curMonth || m === prevMonth))
+              .reduce((sum, m) => {
+                const d = m === curMonth ? cur : prev;
+                return sum + (d.days > 0 ? d.commEst : 0);
+              }, 0);
+            const projBal = bal + allDraftUsdId + unconfEst;
 
-            // ── MTD (current month) ──────────────────────────────
-            const mtdRows = dailyPerf.filter(r => r.trader_name === id && r.trade_date.startsWith(curMonth));
-            const mtdNet  = mtdRows.reduce((s, r) => s + (parseFloat(r.trading_total) || 0), 0);
-            const mtdDays = new Set(mtdRows.map(r => r.trade_date)).size;
-            const { rate: fx, src: fxSrc } = getFx(cfg.ccy);
-            // A: per-row USD factor stored on card for reuse
-            // B: month-to-date USD estimate
-            const mtdUsd = mtdNet * fx;
-            // B/C commission estimate (simplified — no market fee deduction, marked as 粗算)
-            const mtdCommEst = cfg.ccy === "AUD" ? mtdNet * 0.80 * fx - 75 : mtdNet * fx;
-            // C: projected balance at month end if commission is positive
-            const projBal = bal + Math.max(0, mtdCommEst);
-
-            return { id, cfg, bal, reserve, avail, pct, statusColor, statusLabel, mtdNet, mtdDays, mtdUsd, mtdCommEst, projBal, fx, fxSrc };
+            return { id, cfg, bal, reserve, avail, pct, statusColor, statusLabel, cur, prev, projBal, fx: curFx, fxSrc: curFxSrc };
           });
 
           return (
             <div>
               {/* ── Integrated trader cards ── */}
               <div style={{ ...grid("1fr 1fr 1fr"), marginBottom: 20 }}>
-                {traderCards.map(({ id, cfg, bal, reserve, avail, pct, statusColor, statusLabel, mtdNet, mtdDays, mtdUsd, mtdCommEst, projBal, fxSrc }) => (
+                {traderCards.map(({ id, cfg, bal, reserve, avail, pct, statusColor, statusLabel, cur, prev, projBal, fxSrc }) => (
                   <div key={id} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 16, overflow: "hidden" }}>
                     {/* ── Header (same as Overview) ── */}
-                    <div style={{ padding: "20px 24px 16px", borderBottom: `1px solid ${C.border}` }}>
+                    <div style={{ padding: "12px 18px 10px", borderBottom: `1px solid ${C.border}` }}>
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
                         <div>
-                          <div style={{ fontSize: 22, fontWeight: 800 }}>{cfg.name}</div>
-                          <div style={{ fontSize: 15, color: C.muted, marginTop: 2 }}>{id} · {cfg.ccy}</div>
+                          <div style={{ fontSize: 18, fontWeight: 800 }}>{cfg.name}</div>
+                          <div style={{ fontSize: 13, color: C.muted, marginTop: 1 }}>{id} · {cfg.ccy}</div>
                         </div>
-                        <span style={{ fontSize: 13, padding: "2px 8px", borderRadius: 4, background: `${statusColor}18`, color: statusColor, fontWeight: 600 }}>{statusLabel}</span>
+                        <span style={{ fontSize: 12, padding: "2px 7px", borderRadius: 4, background: `${statusColor}18`, color: statusColor, fontWeight: 600 }}>{statusLabel}</span>
                       </div>
                     </div>
 
                     {/* ── Margin balance (same as Overview) ── */}
-                    <div style={{ padding: "18px 24px 14px", borderBottom: `1px solid ${C.border}` }}>
-                      <div style={{ fontSize: 14, color: C.muted, marginBottom: 4 }}>账户总余额</div>
-                      <div style={{ fontSize: 30, fontWeight: 800, color: statusColor, lineHeight: 1.1 }}>${f2(bal)}</div>
-                      <div style={{ fontSize: 14, color: C.faint, marginBottom: 12 }}>USD</div>
+                    <div style={{ padding: "10px 18px 10px", borderBottom: `1px solid ${C.border}` }}>
+                      <div style={{ fontSize: 13, color: C.muted, marginBottom: 2 }}>账户总余额</div>
+                      <div style={{ fontSize: 24, fontWeight: 800, color: statusColor, lineHeight: 1.1 }}>${f2(bal)}</div>
+                      <div style={{ fontSize: 12, color: C.faint, marginBottom: 8 }}>USD</div>
                       {/* Progress bar */}
                       <div style={{ height: 5, background: C.elevated, borderRadius: 3, marginBottom: 10, overflow: "hidden" }}>
                         <div style={{ height: "100%", width: `${pct}%`, background: statusColor, borderRadius: 3, transition: "width 0.4s" }} />
                       </div>
-                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, fontSize: 14 }}>
-                        <div style={{ background: C.elevated, borderRadius: 6, padding: "8px 10px" }}>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, fontSize: 13 }}>
+                        <div style={{ background: C.elevated, borderRadius: 6, padding: "6px 8px" }}>
                           <div style={{ color: C.faint, marginBottom: 2 }}>留存要求</div>
                           <div style={{ color: C.muted, fontWeight: 600 }}>${f2(reserve)}</div>
                         </div>
-                        <div style={{ background: C.elevated, borderRadius: 6, padding: "8px 10px" }}>
+                        <div style={{ background: C.elevated, borderRadius: 6, padding: "6px 8px" }}>
                           <div style={{ color: C.faint, marginBottom: 2 }}>可提取</div>
                           <div style={{ color: avail >= 0 ? C.green : C.red, fontWeight: 600 }}>${f2(Math.max(0, avail))}</div>
                         </div>
                       </div>
                     </div>
 
-                    {/* ── 当月业绩（预算）── */}
-                    {mtdDays > 0 && (
-                      <div style={{ padding: "14px 24px 16px", borderTop: `1px solid ${C.border}` }}>
-                        <div style={{ fontSize: 13, fontWeight: 700, color: C.faint, letterSpacing: 0.8, textTransform: "uppercase" as const, marginBottom: 10 }}>
-                          本月 MTD · {mtdDays} 个交易日
-                        </div>
-                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, fontSize: 14 }}>
-                          {/* B-1: MTD 净值（本币） */}
-                          <div style={{ background: C.elevated, borderRadius: 6, padding: "8px 10px" }}>
-                            <div style={{ color: C.faint, marginBottom: 2, fontSize: 12 }}>本月净值</div>
-                            <div style={{ color: mtdNet >= 0 ? C.green : C.red, fontWeight: 700 }}>
-                              {mtdNet >= 0 ? "+" : ""}{mtdNet.toFixed(2)} <span style={{ fontSize: 11, color: C.faint }}>{cfg.ccy}</span>
+                    {/* ── 待确认业绩（本月 + 上月 并排）── */}
+                    {(cur.days > 0 || prev.days > 0) && (
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", borderTop: `1px solid ${C.border}` }}>
+                        {[
+                          { label: "本月", month: curMonth,  d: cur,  extra: true },
+                          { label: "上月", month: prevMonth, d: prev, extra: false },
+                        ].map(({ label, month, d, extra }, ci) => {
+                          if (d.days === 0) return <div key={month} />;
+                          const isDataConfirmed = dailyPerf.some(r => r.trader_name === id && r.trade_date.startsWith(month) && r.is_confirmed === true);
+                          const confirmed = isConfirmed(month) || isDataConfirmed;
+                          const tagColor  = confirmed ? C.green : C.warn;
+                          const tagLabel  = confirmed ? "已核对" : "待确认";
+                          const rows = [
+                            { l: "Trading Total", v: `${d.net >= 0 ? "+" : ""}${d.net.toFixed(2)}`, c: d.net >= 0 ? C.green : C.red },
+                            { l: "折 USD",        v: `${d.usd >= 0 ? "+" : ""}$${d.usd.toFixed(2)}`, c: d.usd >= 0 ? C.green : C.red },
+                            { l: "提成估算",      v: d.commEst > 0 ? `+$${d.commEst.toFixed(2)}` : `未达线（-$${Math.abs(d.commEst).toFixed(2)}）`, c: d.commEst > 0 ? C.green : C.faint },
+                            ...(extra ? [{ l: "预估月末余额", v: `$${projBal.toFixed(2)}`, c: projBal >= reserve ? C.green : C.warn }] : []),
+                          ];
+                          return (
+                            <div key={month} style={{ padding: "10px 14px 12px", borderRight: ci === 0 ? `1px solid ${C.border}` : "none" }}>
+                              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                                <div style={{ fontSize: 12, fontWeight: 700, color: C.muted }}>{label} · {d.days}日</div>
+                                <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 10, fontWeight: 700, background: `${tagColor}22`, color: tagColor }}>{tagLabel}</span>
+                              </div>
+                              {rows.map(({ l, v, c }) => (
+                                <div key={l} style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", padding: "4px 0", borderBottom: `1px solid ${C.border}` }}>
+                                  <span style={{ fontSize: 12, color: C.muted }}>{l}</span>
+                                  <span style={{ fontSize: 15, fontWeight: 700, color: c }}>{v}</span>
+                                </div>
+                              ))}
                             </div>
-                          </div>
-                          {/* B-2: MTD 折 USD */}
-                          <div style={{ background: C.elevated, borderRadius: 6, padding: "8px 10px" }}>
-                            <div style={{ color: C.faint, marginBottom: 2, fontSize: 12 }}>折 USD <span style={{ fontSize: 11 }}>({fxSrc})</span></div>
-                            <div style={{ color: mtdUsd >= 0 ? C.green : C.red, fontWeight: 700 }}>
-                              {mtdUsd >= 0 ? "+" : ""}${mtdUsd.toFixed(2)}
-                            </div>
-                          </div>
-                          {/* B-3: 业绩提成估算 */}
-                          <div style={{ background: C.elevated, borderRadius: 6, padding: "8px 10px" }}>
-                            <div style={{ color: C.faint, marginBottom: 2, fontSize: 12 }}>业绩提成估算</div>
-                            <div style={{ color: mtdCommEst > 0 ? C.green : C.muted, fontWeight: 700 }}>
-                              {mtdCommEst > 0 ? `+$${mtdCommEst.toFixed(2)}` : <span style={{ color: C.faint }}>未达提成线</span>}
-                            </div>
-                          </div>
-                          {/* C: 预估月末余额 */}
-                          <div style={{ background: C.elevated, borderRadius: 6, padding: "8px 10px" }}>
-                            <div style={{ color: C.faint, marginBottom: 2, fontSize: 12 }}>预估月末余额</div>
-                            <div style={{ color: projBal >= reserve ? C.green : C.warn, fontWeight: 700 }}>
-                              ${projBal.toFixed(2)}
-                            </div>
-                          </div>
-                        </div>
-                        <div style={{ marginTop: 6, fontSize: 11, color: C.faint }}>* 提成粗算，未计市场手续费及结算调整</div>
+                          );
+                        })}
                       </div>
                     )}
+                    <div style={{ padding: "4px 14px 7px", fontSize: 11, color: C.faint }}>* 提成粗算，汇率参考最近一次确认汇率</div>
                   </div>
                 ))}
               </div>
@@ -2016,23 +2421,56 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
               <div style={{ ...card, padding: "14px 20px", marginBottom: 16 }}>
                 <div style={{ display: "flex", gap: 12, alignItems: "flex-end", flexWrap: "wrap" }}>
                   <div>
-                    <label style={lbl}>月份</label>
-                    <select style={{ ...inp, width: 130 }} value={dailyMonth}
-                      onChange={e => { setDailyMonth(e.target.value); }}>
-                      {MONTHS.map(m => <option key={m} value={m}>{m}</option>)}
-                    </select>
-                  </div>
-                  <div>
                     <label style={lbl}>交易员</label>
-                    <select style={{ ...inp, width: 140 }} value={dailyFilter.trader}
+                    <select style={{ ...inp, width: 190 }} value={dailyFilter.trader}
                       onChange={e => setDailyFilter(p => ({ ...p, trader: e.target.value }))}>
                       <option value="All">全部</option>
                       {Object.entries(TRADERS).map(([id, t]) => (
-                        <option key={id} value={id}>{t.name} ({id})</option>
+                        <option key={id} value={id}>{t.name} {id}</option>
                       ))}
                     </select>
                   </div>
-                  <button style={ghostBtn()} onClick={() => loadDailyData(dailyMonth)}>↻ 刷新</button>
+                  <div>
+                    <label style={lbl}>开始日期</label>
+                    <input type="date" style={{ ...inp, width: 145 }} value={dailyFilter.dateFrom}
+                      onChange={e => setDailyFilter(p => ({ ...p, dateFrom: e.target.value }))} />
+                  </div>
+                  <div>
+                    <label style={lbl}>结束日期</label>
+                    <input type="date" style={{ ...inp, width: 145 }} value={dailyFilter.dateTo}
+                      onChange={e => setDailyFilter(p => ({ ...p, dateTo: e.target.value }))} />
+                  </div>
+                  <button style={ghostBtn()} onClick={() => {
+                    const now = new Date();
+                    const from = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`;
+                    const to = now.toISOString().slice(0, 10);
+                    setDailyFilter(p => ({ ...p, dateFrom: from, dateTo: to }));
+                    loadDailyData(from, to);
+                  }}>本月</button>
+                  <button style={ghostBtn()} onClick={() => {
+                    const now = new Date();
+                    const y = now.getMonth() === 0 ? now.getFullYear() - 1 : now.getFullYear();
+                    const m = now.getMonth() === 0 ? 12 : now.getMonth();
+                    const pad = (n: number) => String(n).padStart(2, "0");
+                    const lastDay = new Date(y, m, 0).getDate();
+                    const from = `${y}-${pad(m)}-01`;
+                    const to = `${y}-${pad(m)}-${pad(lastDay)}`;
+                    setDailyFilter(p => ({ ...p, dateFrom: from, dateTo: to }));
+                    loadDailyData(from, to);
+                  }}>上个月</button>
+                  <button style={ghostBtn()} onClick={() => loadDailyData(dailyFilter.dateFrom, dailyFilter.dateTo)}>↻ 刷新</button>
+                  <div style={{ width: 1, height: 22, background: C.border, margin: "0 4px" }} />
+                  <input type="file" accept=".csv" ref={dailyUploadRef} onChange={handleDailyUpload} style={{ display: "none" }} />
+                  <button style={ghostBtn()} onClick={() => dailyUploadRef.current?.click()} disabled={loading}>↑ 上传 CSV</button>
+                  <button style={ghostBtn()} onClick={triggerDailyFetch} disabled={fetchingDaily}>
+                    {fetchingDaily ? "抓取中…" : "↓ 抓取"}
+                  </button>
+                  <button style={ghostBtn()} onClick={handleMonthlyFetch} disabled={fetchingDaily}>
+                    {fetchingDaily ? "抓取中…" : "📅 全月抓取"}
+                  </button>
+                  <button style={ghostBtn()} onClick={handleLockCurrentMonth} disabled={loading}>
+                    🔒 数据锁定
+                  </button>
                   <span style={{ fontSize: 14, color: C.faint, marginLeft: "auto" }}>
                     {filtered.length > 0 ? `共 ${filtered.length} 条` : dailyPerf.length === 0 ? "暂无数据，等待 20:00 自动抓取" : "无匹配"}
                   </span>
@@ -2042,8 +2480,8 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
               {/* ── Detail table ── */}
               <div style={{ ...card, padding: 0, overflow: "hidden" }}>
                 <div style={{ padding: "14px 24px", fontSize: 16, fontWeight: 600, borderBottom: `1px solid ${C.border}` }}>每日明细</div>
-                <div style={{ display: "grid", gridTemplateColumns: "110px 90px 72px 96px 96px 72px 72px 80px 106px 86px 88px", padding: "8px 24px", gap: 10, fontSize: 13, fontWeight: 700, color: C.faint, letterSpacing: 0.8, background: C.elevated, borderBottom: `1px solid ${C.border}` }}>
-                  {["日期","交易员","CCY","Gross","Gateway","Sec Fee","Act Fee","Exe Fee","Trading Total","股数","USD估"].map(h => <div key={h}>{h}</div>)}
+                <div style={{ display: "grid", gridTemplateColumns: "110px 90px 68px 72px 96px 96px 72px 72px 80px 106px 86px 88px", padding: "10px 24px", gap: 10, fontSize: 13, fontWeight: 700, color: C.faint, letterSpacing: 0.8, background: C.elevated, borderBottom: `1px solid ${C.border}` }}>
+                  {["日期","交易员","状态","CCY","Gross","Gateway","Sec Fee","Act Fee","Exe Fee","Trading Total","股数","USD估"].map(h => <div key={h}>{h}</div>)}
                 </div>
                 {filtered.length === 0 && (
                   <div style={{ padding: "40px 24px", fontSize: 15, color: C.faint, textAlign: "center" }}>
@@ -2053,24 +2491,32 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                 {pagedRows.map((r, i) => {
                   const net  = parseFloat(r.trading_total) || 0;
                   const ccy  = r.currency ?? TRADERS[r.trader_name]?.ccy ?? "";
-                  const rowFx = getFx(ccy).rate;
+                  const rowTraderId = TRADERS[r.trader_name] ? r.trader_name : (Object.keys(TRADERS).find(id => TRADERS[id].name === r.trader_name) ?? r.trader_name);
+                  const rowMonth = (r.trade_date || "").slice(0, 7);
+                  const rowFx = getFx(ccy, rowMonth).rate;
                   const usdEst = net * rowFx;
+                  const rowIsConf = (commissions.some((c:any) => c.trader_id === rowTraderId && c.period === rowMonth && c.status === "confirmed") || r.is_confirmed === true);
                   return (
-                    <div key={r.id ?? i} style={{ display: "grid", gridTemplateColumns: "110px 90px 72px 96px 96px 72px 72px 80px 106px 86px 88px", padding: "10px 24px", gap: 10, borderBottom: `1px solid ${C.border}`, background: i % 2 ? `${C.elevated}60` : "transparent", fontSize: 15, alignItems: "center" }}>
+                    <div key={r.id ?? i} style={{ display: "grid", gridTemplateColumns: "110px 90px 68px 72px 96px 96px 72px 72px 80px 106px 86px 88px", padding: "11px 24px", gap: 10, borderBottom: `1px solid ${C.border}`, background: i % 2 ? `${C.elevated}60` : "transparent", fontSize: 15, alignItems: "center" }}>
                       <div style={{ color: C.muted }}>
-                        {r._source === "trade_records" ? <span style={{ color: C.green, fontSize: 12 }}>月汇总</span> : r.trade_date}
+                        {r._source === "monthly_confirmed"
+                          ? <><span style={{ color: C.blue, fontSize: 12, fontWeight: 700 }}>月度确认</span>{r._discrepancy && <span title={r._discrepancy} style={{ marginLeft: 4, color: C.warn, fontSize: 11 }}>⚠</span>}</>
+                          : r._source === "trade_records"
+                            ? <span style={{ color: C.green, fontSize: 12 }}>月汇总</span>
+                            : r.trade_date}
                       </div>
                       <div style={{ fontWeight: 600 }}>{TRADERS[r.trader_name]?.name ?? r.trader_name}</div>
+                      <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 8, fontWeight: 700, background: rowIsConf ? `${C.green}22` : `${C.warn}22`, color: rowIsConf ? C.green : C.warn }}>{rowIsConf ? "已核对" : "待确认"}</span>
                       <div style={{ color: C.faint }}>{ccy}</div>
-                      <div>{parseFloat(r.gross || 0).toFixed(2)}</div>
-                      <div style={{ color: C.red }}>{parseFloat(r.gateway_charge || 0).toFixed(4)}</div>
+                      <div style={{ color: (parseFloat(r.gross || 0)) >= 0 ? C.green : C.red }}>{parseFloat(r.gross || 0).toFixed(2)}</div>
+                      <div style={{ color: C.red }}>{parseFloat(r.gateway_charge || 0) !== 0 ? `-${parseFloat(r.gateway_charge || 0).toFixed(4)}` : "0.0000"}</div>
                       <div style={{ color: C.faint }}>{parseFloat(r.sec_fee  || 0).toFixed(4)}</div>
                       <div style={{ color: C.faint }}>{parseFloat(r.act_fee  || 0).toFixed(4)}</div>
                       <div style={{ color: C.faint }}>{parseFloat(r.exe_fee  || 0).toFixed(4)}</div>
                       <div style={{ fontWeight: 700, color: net >= 0 ? C.green : C.red }}>
                         {net >= 0 ? "+" : ""}{net.toFixed(4)}
                       </div>
-                      <div style={{ color: C.muted }}>{Math.round(parseFloat(r.shares_traded || 0)).toLocaleString()}</div>
+                      <div style={{ color: C.muted }}>{Math.round(parseFloat(r.shares || r.shares_traded || 0)).toLocaleString()}</div>
                       {/* A: 单日 USD 估算 */}
                       <div style={{ fontWeight: 600, color: usdEst >= 0 ? C.green : C.red, fontSize: 14 }}>
                         {usdEst >= 0 ? "+" : ""}${usdEst.toFixed(2)}
@@ -2085,15 +2531,20 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                   const totExe   = filtered.reduce((s, r) => s + (parseFloat(r.exe_fee)          || 0), 0);
                   const totUsd   = filtered.reduce((s, r) => {
                     const ccy = r.currency ?? TRADERS[r.trader_name]?.ccy ?? "";
-                    return s + (parseFloat(r.trading_total) || 0) * getFx(ccy).rate;
+                    const month = (r.trade_date || "").slice(0, 7);
+                    return s + (parseFloat(r.trading_total) || 0) * getFx(ccy, month).rate;
                   }, 0);
                   return (
-                    <div style={{ display: "flex", justifyContent: "flex-end", gap: 28, padding: "11px 24px", borderTop: `1px solid ${C.border}`, fontSize: 15, color: C.muted }}>
-                      <span>Gross：<strong>{totGross.toFixed(2)}</strong></span>
-                      <span>Gateway：<strong style={{ color: C.red }}>{totGw.toFixed(4)}</strong></span>
-                      <span>Exe：<strong>{totExe.toFixed(4)}</strong></span>
-                      <span>Trading Total：<strong style={{ color: totNet >= 0 ? C.green : C.red }}>{totNet >= 0 ? "+" : ""}{totNet.toFixed(4)}</strong></span>
-                      <span>USD估：<strong style={{ color: totUsd >= 0 ? C.green : C.red }}>{totUsd >= 0 ? "+" : ""}${totUsd.toFixed(2)}</strong></span>
+                    <div style={{ display: "grid", gridTemplateColumns: "110px 90px 68px 72px 96px 96px 72px 72px 80px 106px 86px 88px", padding: "10px 24px", gap: 10, borderTop: `1px solid ${C.border}`, fontSize: 13, fontWeight: 700, background: `${C.elevated}80`, alignItems: "center" }}>
+                      <div style={{ color: C.faint }}>合计</div>
+                      <div /><div /><div />
+                      <div style={{ color: totGross >= 0 ? C.green : C.red }}>{totGross.toFixed(2)}</div>
+                      <div style={{ color: C.red }}>-{totGw.toFixed(4)}</div>
+                      <div /><div />
+                      <div style={{ color: C.faint }}>{totExe.toFixed(4)}</div>
+                      <div style={{ color: totNet >= 0 ? C.green : C.red }}>{totNet >= 0 ? "+" : ""}{totNet.toFixed(4)}</div>
+                      <div />
+                      <div style={{ color: totUsd >= 0 ? C.green : C.red }}>{totUsd >= 0 ? "+" : ""}${totUsd.toFixed(2)}</div>
                     </div>
                   );
                 })()}
@@ -2110,83 +2561,6 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
           );
         })()}
 
-        {/* ══ RECORDS ══ */}
-        {tab === "records" && (
-          <div>
-            {/* Trade records by period */}
-            <div style={{...card, padding:0, overflow:"hidden", marginBottom:20}}>
-              <div style={{padding:"16px 24px", fontSize:15, fontWeight:600, borderBottom:`1px solid ${C.border}`}}>CSV 交易数据汇总</div>
-              <div style={{display:"grid",gridTemplateColumns:"90px 100px 70px 120px 120px 110px 110px",padding:"9px 24px",gap:10,fontSize:11,fontWeight:700,color:C.faint,letterSpacing:0.8,background:C.elevated,borderBottom:`1px solid ${C.border}`}}>
-                {["月份","交易员","Currency","Gross","Gateway","NET","Exe Fee"].map(h=><div key={h}>{h}</div>)}
-              </div>
-              {tradeRecords.length===0&&<div style={{padding:"28px",fontSize:14,color:C.faint,textAlign:"center"}}>暂无数据</div>}
-              {[...tradeRecords].sort((a,b)=>b.period.localeCompare(a.period))
-                .slice(rawTradePage*RAW_PAGE_SIZE,(rawTradePage+1)*RAW_PAGE_SIZE)
-                .map((r:any,i:number)=>{
-                  const net=(r.gross||0)-(r.gateway_charge||0);
-                  return (
-                    <div key={r.id||i} style={{display:"grid",gridTemplateColumns:"90px 100px 70px 120px 120px 110px 110px",padding:"11px 24px",gap:10,borderBottom:`1px solid ${C.border}`,background:i%2?`${C.elevated}60`:"transparent",fontSize:13}}>
-                      <div style={{color:C.muted}}>{r.period}</div>
-                      <div style={{fontWeight:600}}>{TRADERS[r.trader_id]?.name||r.trader_id}</div>
-                      <div style={{color:C.muted}}>{r.ccy}</div>
-                      <div>{r.gross!=null?r.gross.toFixed(2):"—"}</div>
-                      <div style={{color:C.red}}>{r.gateway_charge!=null?`-${r.gateway_charge.toFixed(2)}`:"—"}</div>
-                      <div style={{fontWeight:600,color:net>=0?C.green:C.red}}>{net.toFixed(2)}</div>
-                      <div style={{color:C.red}}>{r.exe_fee!=null?`-${r.exe_fee.toFixed(2)}`:"—"}</div>
-                    </div>
-                  );
-              })}
-              {tradeRecords.length > RAW_PAGE_SIZE && (
-                <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:10,padding:"10px 0",borderTop:`1px solid ${C.border}`}}>
-                  <button onClick={()=>setRawTradePage(p=>Math.max(0,p-1))} disabled={rawTradePage===0} style={ghostBtn()}>← 上页</button>
-                  <span style={{fontSize:13,color:C.muted}}>第 {rawTradePage+1} / {Math.ceil(tradeRecords.length/RAW_PAGE_SIZE)} 页</span>
-                  <button onClick={()=>setRawTradePage(p=>Math.min(Math.ceil(tradeRecords.length/RAW_PAGE_SIZE)-1,p+1))} disabled={(rawTradePage+1)*RAW_PAGE_SIZE>=tradeRecords.length} style={ghostBtn()}>下页 →</button>
-                </div>
-              )}
-            </div>
-            {/* Settlement records list */}
-            <div style={{...card, padding:0, overflow:"hidden"}}>
-              <div style={{padding:"16px 24px", fontSize:15, fontWeight:600, borderBottom:`1px solid ${C.border}`}}>Settlement 记录</div>
-              <div style={{display:"grid",gridTemplateColumns:"90px 120px 120px 120px 140px 1fr",padding:"9px 24px",gap:10,fontSize:11,fontWeight:700,color:C.faint,letterSpacing:0.8,background:C.elevated,borderBottom:`1px solid ${C.border}`}}>
-                {["月份","AUD Equity","HKD Equity","Post Exchange","AUD/USD (汇率2)","备注"].map(h=><div key={h}>{h}</div>)}
-              </div>
-              {settlements.length===0&&<div style={{padding:"28px",fontSize:14,color:C.faint,textAlign:"center"}}>暂无记录</div>}
-              {settlements.slice(rawSettlPage*RAW_PAGE_SIZE,(rawSettlPage+1)*RAW_PAGE_SIZE).map((s:any,i:number)=>{
-                const audPe=s.payment_exchange?.find((r:any)=>r.from_ccy==="AUD"&&r.to_ccy==="USD");
-                const hkdPe=s.payment_exchange?.find((r:any)=>r.from_ccy==="HKD"&&r.to_ccy==="USD");
-                return (
-                  <div key={s.period} style={{display:"grid",gridTemplateColumns:"90px 120px 120px 120px 140px 1fr",padding:"11px 24px",gap:10,borderBottom:`1px solid ${C.border}`,background:i%2?`${C.elevated}60`:"transparent",fontSize:13}}>
-                    <div style={{fontWeight:700}}>{s.period}</div>
-                    <div>{s.equity_aud!=null?f2(s.equity_aud):"—"}</div>
-                    <div>{s.equity_hkd!=null?f2(Math.abs(s.equity_hkd)):"—"}</div>
-                    <div style={{color:C.green}}>{s.post_exchange_usd!=null?`$${f2(s.post_exchange_usd)}`:"—"}</div>
-                    <div style={{color:C.blue}}>{audPe?audPe.rate:(hkdPe?hkdPe.rate:"—")}</div>
-                    <div style={{color:C.faint,fontSize:12}}>{s.fx_notes||"—"}</div>
-                  </div>
-                );
-              })}
-              {settlements.length > RAW_PAGE_SIZE && (
-                <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:10,padding:"10px 0",borderTop:`1px solid ${C.border}`}}>
-                  <button onClick={()=>setRawSettlPage(p=>Math.max(0,p-1))} disabled={rawSettlPage===0} style={ghostBtn()}>← 上页</button>
-                  <span style={{fontSize:13,color:C.muted}}>第 {rawSettlPage+1} / {Math.ceil(settlements.length/RAW_PAGE_SIZE)} 页</span>
-                  <button onClick={()=>setRawSettlPage(p=>Math.min(Math.ceil(settlements.length/RAW_PAGE_SIZE)-1,p+1))} disabled={(rawSettlPage+1)*RAW_PAGE_SIZE>=settlements.length} style={ghostBtn()}>下页 →</button>
-                </div>
-              )}
-            </div>
-            {/* README viewer */}
-            <div style={{...card, padding:0, overflow:"hidden", marginTop:20}}>
-              <button onClick={()=>setReadmeOpen(o=>!o)} style={{ width:"100%", display:"flex", alignItems:"center", justifyContent:"space-between", padding:"16px 24px", background:"transparent", border:"none", cursor:"pointer", fontFamily:font }}>
-                <span style={{fontSize:15, fontWeight:600, color:C.text}}>系统文档 README</span>
-                <span style={{fontSize:18, color:C.muted}}>{readmeOpen ? "▲" : "▼"}</span>
-              </button>
-              {readmeOpen && (
-                <div style={{ padding:"0 28px 28px", maxHeight:700, overflowY:"auto" }}>
-                  {readme ? renderReadme(readme) : <div style={{color:C.faint,fontSize:13,padding:"20px 0"}}>加载中…</div>}
-                </div>
-              )}
-            </div>
-          </div>
-        )}
 
         {/* ══ CONFIG ══ */}
         {tab === "config" && (
@@ -2194,14 +2568,47 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
             <div style={{fontSize:17,fontWeight:700,marginBottom:6}}>结算参数</div>
             <div style={{fontSize:14,color:C.muted,marginBottom:24}}>每月结算前填写。上传 Settlement 截图/PDF 后汇率自动同步，也可手填。</div>
             <div style={grid("1fr 1fr 1fr 1fr")}>
-              {[["月份","period","text"],["ASX 数据费 (AUD)","asx_aud","number"],["CHIXA 数据费 (USD)","chixa_usd","number"],["HKE 数据费 (HKD)","hke_hkd","number"],["Office 费 (USD)","office_usd","number"],["Wire 费 (USD)","wire_usd","number"],["AUD/USD 汇率","fx_aud_usd","number"],["HKD/USD 汇率","fx_hkd_usd","number"]].map(([label,key,type])=>(
+              {[["月份","period","text"],["ASX 数据费 (AUD)","asx_aud","number"],["CHIXA 数据费 (USD)","chixa_usd","number"],["HKE 数据费 (HKD)","hke_hkd","number"],["Office 费 (USD)","office_usd","number"],["Wire 费 (USD)","wire_usd","number"]].map(([label,key,type])=>{
+                const isFxField = key==="fx_aud_usd"||key==="fx_hkd_usd";
+                const src = key==="fx_aud_usd" ? fxSrc.aud : fxSrc.hkd;
+                const fromPdf = src==="pdf"||src==="derived";
+                const fromPrev = src==="prev";
+                return (
                 <div key={key as string}>
-                  <label style={lbl}>{label}{(key==="fx_aud_usd"||key==="fx_hkd_usd")&&<span style={{color:C.blue,marginLeft:6,fontSize:11}}>⚡ PDF自动同步</span>}</label>
-                  <input type={type as string} step="0.00000001" style={inp} value={fForm[key as string]} onChange={e=>setFForm((p:any)=>({...p,[key as string]:e.target.value}))} placeholder={key==="period"?"2026-02":"留空可稍后补填"} />
+                  <label style={lbl}>
+                    {label}
+                    {isFxField && (
+                      <span style={{marginLeft:6,fontSize:11,color: fromPdf ? C.blue : C.faint}}>
+                        ⚡ {fromPdf ? (src==="derived" ? "Loss Coverage推算" : "PDF") : fromPrev ? "参考上期" : "手动/未同步"}
+                      </span>
+                    )}
+                    {isFxField && fromPrev && (
+                      <span style={{marginLeft:6,fontSize:11,fontWeight:700,color:C.warn}}>待定</span>
+                    )}
+                  </label>
+                  <input
+                    type={type as string} step="0.00000001" style={inp}
+                    value={fForm[key as string]}
+                    onChange={e=>{
+                      setFForm((p:any)=>({...p,[key as string]:e.target.value}));
+                      if(isFxField) setFxSrc(s=>({...s,[key==="fx_aud_usd"?"aud":"hkd"]:""}));
+                    }}
+                    placeholder={key==="period"?"2026-02":"留空可稍后补填"}
+                  />
                 </div>
-              ))}
+              )})}
             </div>
             <button onClick={saveFees} style={{...filledBtn(),marginTop:24}} disabled={loading}>保存</button>
+          </div>
+        )}
+
+        {/* ══ README ══ */}
+        {tab === "readme" && (
+          <div style={card}>
+            <div style={{fontSize:17,fontWeight:700,marginBottom:20}}>系统文档 README</div>
+            {readme
+              ? <div>{renderReadme(readme)}</div>
+              : <div style={{color:C.faint,fontSize:13,padding:"20px 0"}}>加载中…</div>}
           </div>
         )}
 
