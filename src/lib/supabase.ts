@@ -80,8 +80,8 @@ export const db = {
   // Margin
   getBalances: () => supabase.from("margin_balances").select("*"),
   getLedger:   (traderId?: string) => traderId
-    ? supabase.from("margin_ledger").select("*").eq("trader_id", traderId).order("entry_date", { ascending: false })
-    : supabase.from("margin_ledger").select("*").order("entry_date", { ascending: false }),
+    ? supabase.from("margin_ledger").select("*").eq("trader_id", traderId).order("created_at", { ascending: false })
+    : supabase.from("margin_ledger").select("*").order("created_at", { ascending: false }),
 
   addMarginEntry: async (entry: {
     trader_id: string; entry_date: string; type: string;
