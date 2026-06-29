@@ -459,17 +459,29 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
     try {
       const Tesseract = (window as any).Tesseract;
       if (!Tesseract) throw new Error("Tesseract.js not loaded");
-      const { data: { text } } = await Tesseract.recognize(file, 'chi_sim');
-      const g = (pattern: RegExp) => { const m = text.match(pattern); return m ? toNum(m[1]) : null; };
-      setSForm((p: any) => ({
-        ...p,
-        equity_aud: g(/(?:Equity|股权)\s+([\d,]+\.?\d*)/) ?? p.equity_aud,
-        cut_aud: g(/(?:Cut|扣除).*?15%\s+([\d,]+\.?\d*)/) ?? p.cut_aud,
-        net_aud: g(/(?:Net|净值).*?85%\s+([\d,]+\.?\d*)/) ?? p.net_aud,
-        exe_aud: g(/(?:Transaction|交易).*?fees?\s+([\d,]+\.?\d*)/) ?? p.exe_aud,
-      }));
-      showToast("✓ 截图 OCR 识别成功，已填入 AUD 数据");
+      console.log("Starting OCR...");
+      const { data: { text } } = await Tesseract.recognize(file, 'eng');
+      console.log("OCR 结果:", text);
+      const toNum2 = (s: string) => { const n = parseFloat(s.replace(/,/g, "")); return isNaN(n) ? null : n; };
+      const extractValue = (text: string, pattern: RegExp) => {
+        const match = text.match(pattern);
+        if (match) { console.log("匹配到:", pattern, match[1]); return toNum2(match[1]); }
+        return null;
+      };
+      setSForm((p: any) => {
+        const updated = {
+          ...p,
+          equity_aud: extractValue(text, /Equity\s+([\d,]+\.?\d*)/) ?? p.equity_aud,
+          cut_aud: extractValue(text, /Cut for Equity\s+([\d,]+\.?\d*)/) ?? p.cut_aud,
+          net_aud: extractValue(text, /Net for Equity\s+([\d,]+\.?\d*)/) ?? p.net_aud,
+          exe_aud: extractValue(text, /Total Transaction Fees\s+([\d,]+\.?\d*)/) ?? p.exe_aud,
+        };
+        console.log("更新表单:", updated);
+        return updated;
+      });
+      showToast("✓ 截图 OCR 识别完成，请检查 Console 查看识别结果");
     } catch (err: any) {
+      console.error("OCR 错误:", err);
       showToast("OCR 识别失败: " + err.message, false);
     }
     setLoading(false);
