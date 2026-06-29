@@ -1,7 +1,6 @@
 // frontend/src/pages/AdminDashboard.tsx
 import { useState, useEffect, useRef } from "react";
 import { supabase, db, callFunction, callFunctionForm } from "../lib/supabase";
-import Tesseract from "tesseract.js";
 
 // ── Static trader config ─────────────────────────────────────
 const TRADERS: Record<string, { name: string; ccy: string; markets: string; since: string; reserve: number }> = {
@@ -453,39 +452,80 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
 
   // ── Settlement screenshot preview & OCR ────────────────────────
   const handleImgUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]; if (!file) return;
+    const file = e.target.files?.[0];
+    if (!file) return;
     const url = URL.createObjectURL(file);
     setSettlImg(url);
-    setLoading(true);
+    console.log("📸 上传了截图:", file.name, "大小:", file.size);
+    showToast("✓ 截图已上传，正在识别...");
+
     try {
-      console.log("Starting OCR with file:", file.name);
+      // 动态导入 Tesseract 以避免模块加载问题
+      const Tesseract = (await import("tesseract.js")).default;
+      console.log("Tesseract 已加载");
+
       const worker = await Tesseract.createWorker();
+      console.log("Worker 创建中...");
+
       const { data: { text } } = await worker.recognize(file);
+      console.log("OCR 识别结果:\n", text);
       await worker.terminate();
-      console.log("OCR 结果:", text);
-      const toNum2 = (s: string) => { const n = parseFloat(s.replace(/,/g, "")); return isNaN(n) ? null : n; };
-      const extractValue = (text: string, pattern: RegExp) => {
-        const match = text.match(pattern);
-        if (match) { console.log("匹配到:", pattern, "值:", match[1]); return toNum2(match[1]); }
-        return null;
+
+      // 提取数字的辅助函数
+      const toNum = (s: string) => {
+        const n = parseFloat(s.replace(/[,\s]/g, ""));
+        return isNaN(n) ? null : n;
       };
-      setSForm((p: any) => {
-        const updated = {
+
+      // 更灵活的匹配 - 支持多种格式
+      const patterns = {
+        equity_aud: [
+          /Equity[\s\n]+AUD[\s\n]+([\d,]+\.?\d*)/i,
+          /Equity.*?([\d,]+\.?\d*)/i,
+        ],
+        cut_aud: [
+          /Cut.*?Equity[\s\n]+([\d,]+\.?\d*)/i,
+          /Cut.*?([\d,]+\.?\d*)/i,
+        ],
+        net_aud: [
+          /Net.*?Equity[\s\n]+([\d,]+\.?\d*)/i,
+          /Net[\s\n]+([\d,]+\.?\d*)/i,
+        ],
+        exe_aud: [
+          /Total.*?Transaction.*?Fees?[\s\n]+([-\d,]+\.?\d*)/i,
+          /Transaction.*?Fees?[\s\n]+([-\d,]+\.?\d*)/i,
+        ],
+      };
+
+      const extracted: any = {};
+      for (const [key, patternList] of Object.entries(patterns)) {
+        for (const pattern of patternList as RegExp[]) {
+          const match = text.match(pattern);
+          if (match) {
+            extracted[key] = toNum(match[1]);
+            console.log(`✓ ${key}: ${match[1]} → ${extracted[key]}`);
+            break;
+          }
+        }
+      }
+
+      if (Object.keys(extracted).length > 0) {
+        setSForm((p: any) => ({
           ...p,
-          equity_aud: extractValue(text, /Equity\s+([\d,]+\.?\d*)/) ?? p.equity_aud,
-          cut_aud: extractValue(text, /Cut\s+for\s+Equity\s+([\d,]+\.?\d*)/) ?? p.cut_aud,
-          net_aud: extractValue(text, /Net\s+for\s+Equity\s+([\d,]+\.?\d*)/) ?? p.net_aud,
-          exe_aud: extractValue(text, /Total\s+Transaction\s+Fees\s+([-\d,]+\.?\d*)/) ?? p.exe_aud,
-        };
-        console.log("更新表单:", updated);
-        return updated;
-      });
-      showToast("✓ 截图 OCR 识别完成");
+          equity_aud: extracted.equity_aud ?? p.equity_aud,
+          cut_aud: extracted.cut_aud ?? p.cut_aud,
+          net_aud: extracted.net_aud ?? p.net_aud,
+          exe_aud: extracted.exe_aud ?? p.exe_aud,
+        }));
+        showToast("✓ 截图识别完成，已自动填入数据");
+      } else {
+        showToast("⚠ 未能识别表格数据，请检查截图内容", false);
+      }
     } catch (err: any) {
-      console.error("OCR 错误:", err);
-      showToast("OCR 识别失败: " + err.message, false);
+      console.error("❌ 识别错误:", err);
+      showToast("识别失败: " + err.message, false);
     }
-    setLoading(false);
+
     if (e.target) e.target.value = "";
   };
 
