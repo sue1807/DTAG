@@ -1,326 +1,174 @@
-// frontend/src/pages/TraderDashboard.tsx
-import { useState, useEffect, useRef } from "react";
+﻿import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase, db, signOut } from "../lib/supabase";
 
-const TRADER_META: Record<string, { name: string; ccy: string; color: string; exchange: string }> = {
-  HONG045: { name: "王博",   ccy: "AUD", color: "#00C8FF", exchange: "ASX · CHIXA" },
-  PENGCDU: { name: "马金斗", ccy: "AUD", color: "#00EF7A", exchange: "ASX · CHIXA" },
-  LULUSHI: { name: "石路路", ccy: "HKD", color: "#FFB300", exchange: "HKEx" },
+const TRADER_META: Record<string, { name: string; ccy: string; color: string; exchange: string; reserve: number }> = {
+  HONG045: { name: "王博", ccy: "AUD", color: "#00C8FF", exchange: "ASX · CHIXA", reserve: 1000 },
+  PENGCDU: { name: "马金斗", ccy: "AUD", color: "#00EF7A", exchange: "ASX · CHIXA", reserve: 1000 },
+  LULUSHI: { name: "石路路", ccy: "HKD", color: "#FFB300", exchange: "HKEx", reserve: 500 },
 };
-
 const f2 = (n: number) => Math.abs(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
+function expandPeriodCovered(pc: any): string[] {
+  if (!pc) return [];
+  const parts = Array.isArray(pc) ? pc.map(String) : String(pc).split(",").map(s => s.trim()).filter(Boolean);
+  const out: string[] = [];
+  for (const part of parts) {
+    const m = part.match(/^(\d{4})[.\-](\d{2})[- ](\d{4})[.\-](\d{2})$/);
+    if (!m) { out.push(part.replace(/\./g, "-")); continue; }
+    let y = Number(m[1]), mo = Number(m[2]);
+    const ey = Number(m[3]), em = Number(m[4]);
+    while (y < ey || (y === ey && mo <= em)) {
+      out.push(`${y}-${String(mo).padStart(2, "0")}`);
+      mo++; if (mo > 12) { mo = 1; y++; }
+    }
+  }
+  return out;
+}
+
 export default function TraderDashboard({ traderId, onLogout }: { traderId: string; onLogout: () => void }) {
-  const [tab, setTab]          = useState<"home"|"monthly"|"margin">("home");
+  const [tab, setTab] = useState<"home" | "monthly" | "margin">("home");
   const [performance, setPerf] = useState<any[]>([]);
-  const [payouts, setPayouts]  = useState<any[]>([]);
-  const [balance, setBalance]  = useState<any>(null);
-  const [ledger, setLedger]    = useState<any[]>([]);
+  const [payouts, setPayouts] = useState<any[]>([]);
+  const [balance, setBalance] = useState<any>(null);
+  const [ledger, setLedger] = useState<any[]>([]);
+  const [tradeRecs, setTradeRecs] = useState<any[]>([]);
+  const [dailyRecs, setDailyRecs] = useState<any[]>([]);
+  const [periodFeesAll, setPeriodFeesAll] = useState<any[]>([]);
   const [refreshing, setRefreshing] = useState(false);
-  const [lastUpdate, setLastUpdate] = useState<Date>(new Date());
-  const [expandedPeriod, setExpandedPeriod] = useState<string|null>(null);
-  const [tradeDetails, setTradeDetails] = useState<Record<string, any>>({});
-  const [periodFees, setPeriodFees] = useState<Record<string, any>>({});
-  const pullStartY   = useRef(0);
+  const [lastUpdate, setLastUpdate] = useState(new Date());
+  const [expandedPeriod, setExpandedPeriod] = useState<string | null>(null);
+  const pullStartY = useRef(0);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  const meta  = TRADER_META[traderId] || { name: traderId, ccy: "—", color: "#00C8FF", exchange: "—" };
-  const color = meta.color;
+  const meta = TRADER_META[traderId] || { name: traderId, ccy: "-", color: "#00C8FF", exchange: "-", reserve: 1000 };
+  const C = { bg: "#060A12", card: "#0D1829", border: "#182840", dim: "#4A6882", text: "#C4DAF0", green: "#00EF7A", red: "#FF2847", warn: "#FFB300", blue: "#4080FF" };
+  const now = new Date();
+  const currentPeriod = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  const previousPeriod = `${new Date(now.getFullYear(), now.getMonth() - 1, 1).getFullYear()}-${String(new Date(now.getFullYear(), now.getMonth() - 1, 1).getMonth() + 1).padStart(2, "0")}`;
 
   const loadData = async () => {
     await Promise.all([
-      supabase.from("commission_results")
-        .select("*").eq("trader_id", traderId)
-        .order("period", { ascending: false })
-        .then(r => setPerf(r.data || [])),
-      supabase.from("commission_payouts")
-        .select("*").eq("trader_id", traderId)
-        .order("payout_date", { ascending: false })
-        .then(r => setPayouts(r.data || [])),
-      db.getBalances().then(r => {
-        const b = (r.data || []).find((x: any) => x.trader_id === traderId);
-        setBalance(b);
-      }),
+      supabase.from("commission_results").select("*").eq("trader_id", traderId).order("period", { ascending: false }).then(r => setPerf(r.data || [])),
+      supabase.from("commission_payouts").select("*").eq("trader_id", traderId).order("payout_date", { ascending: false }).then(r => setPayouts(r.data || [])),
+      db.getBalances().then(r => setBalance((r.data || []).find((x: any) => x.trader_id === traderId) || null)),
       db.getLedger(traderId).then(r => setLedger(r.data || [])),
+      supabase.from("trade_records").select("*").eq("trader_id", traderId).order("period", { ascending: false }).then(r => setTradeRecs(r.data || [])),
+      supabase.from("daily_performance").select("trade_date, trading_total, gross, gateway_charge, exe_fee").eq("trader_name", traderId).order("trade_date", { ascending: false }).then(r => setDailyRecs(r.data || [])),
+      supabase.from("period_fees").select("*").order("period", { ascending: false }).then(r => setPeriodFeesAll(r.data || [])),
     ]);
     setLastUpdate(new Date());
   };
-
   useEffect(() => { loadData(); }, [traderId]);
 
-  const toggleDetail = async (p: string) => {
-    if (expandedPeriod === p) { setExpandedPeriod(null); return; }
-    setExpandedPeriod(p);
-    if (!tradeDetails[p]) {
-      const { data } = await supabase.from("trade_records")
-        .select("*").eq("trader_id", traderId).eq("period", p).single();
-      if (!periodFees[p]) {
-        const { data: fees } = await supabase.from("period_fees").select("fx_aud_usd,fx_hkd_usd").eq("period", p).single();
-        if (fees) setPeriodFees(prev => ({ ...prev, [p]: fees }));
-      }
-      setTradeDetails(prev => ({ ...prev, [p]: data || null }));
-    }
+  const parseDraftMonthlyUsd = (c: any): number | null => {
+    if (c.monthly_usd === null || c.monthly_usd === undefined || c.monthly_usd === "") return null;
+    const n = parseFloat(c.monthly_usd);
+    return Number.isFinite(n) ? n : null;
+  };
+  const hasTradeRecordForMonth = (month: string) => tradeRecs.some((r: any) => r.period === month);
+  const isEffectiveCommission = (c: any) => c.status === "confirmed" || (c.status === "draft" && parseDraftMonthlyUsd(c) !== null && hasTradeRecordForMonth(c.period));
+
+  const dailyByMonth = useMemo(() => {
+    const m = new Map<string, { net: number; exe: number }>();
+    dailyRecs.forEach((r: any) => {
+      const month = String(r.trade_date || "").slice(0, 7);
+      if (!month) return;
+      const net = parseFloat(r.trading_total || 0) || (parseFloat(r.gross || 0) - parseFloat(r.gateway_charge || 0));
+      const exe = parseFloat(r.exe_fee || 0) || 0;
+      const prev = m.get(month) || { net: 0, exe: 0 };
+      m.set(month, { net: prev.net + net, exe: prev.exe + exe });
+    });
+    return m;
+  }, [dailyRecs]);
+
+  const getPeriodFee = (period: string) => {
+    const isAud = meta.ccy === "AUD";
+    return [...periodFeesAll].sort((a, b) => b.period.localeCompare(a.period)).find((p: any) => p.period <= period && (isAud ? parseFloat(p.fx_aud_usd || 0) > 0 : parseFloat(p.fx_hkd_usd || 0) > 0));
+  };
+  const getFallbackFx = (period: string) => {
+    const row = performance
+      .filter((c: any) => c.status === "confirmed" && c.period <= period && parseFloat(c.fx_rate || 0) > 0)
+      .sort((a: any, b: any) => b.period.localeCompare(a.period))[0];
+    return row ? parseFloat(row.fx_rate) : 0;
+  };
+  const getEstCommUsd = (netNative: number, exeNative: number, period: string): number | null => {
+    const isAud = meta.ccy === "AUD";
+    const pf = getPeriodFee(period);
+    const fx = pf ? parseFloat(isAud ? pf.fx_aud_usd : pf.fx_hkd_usd) : getFallbackFx(period);
+    if (!fx) return null;
+    if (isAud) return (netNative * 0.8 - exeNative - parseFloat(pf?.asx_aud ?? 264.44) / 2 - parseFloat(pf?.chixa_usd ?? 129) / 2 / fx) * fx - 75;
+    return (netNative - exeNative - parseFloat(pf?.hke_hkd ?? 451.70)) * fx;
   };
 
-  const handleTouchStart = (e: React.TouchEvent) => { pullStartY.current = e.touches[0].clientY; };
-  const handleTouchEnd   = async (e: React.TouchEvent) => {
-    const diff = e.changedTouches[0].clientY - pullStartY.current;
-    if (diff > 70 && (containerRef.current?.scrollTop || 0) <= 0 && !refreshing) {
-      setRefreshing(true); await loadData(); setRefreshing(false);
+  const baseBalance = parseFloat(balance?.balance_usd || 0);
+  const confirmedPerfMap = new Map(performance.filter((c: any) => c.status === "confirmed").map((c: any) => [c.period, c]));
+  const perfMap = new Map(performance.filter(isEffectiveCommission).map((c: any) => [c.period, c]));
+  const tradeMap = new Map(tradeRecs.map((r: any) => [r.period, r]));
+  const confirmedPeriods = new Set(performance.filter((c: any) => c.status === "confirmed").map((c: any) => c.period));
+  let pendingRiskEst = 0;
+  [currentPeriod, previousPeriod].forEach(month => {
+    if (confirmedPeriods.has(month)) return;
+    const d = dailyByMonth.get(month);
+    if (d) {
+      pendingRiskEst += getEstCommUsd(d.net, d.exe, month) ?? 0;
+      return;
     }
-  };
-
-  const balUsd      = parseFloat(balance?.balance_usd || 0);
-  const balStatus   = balance?.status || "ok";
-  const balColor    = balStatus === "danger" ? "#FF2847" : balStatus === "warning" ? "#FFB300" : "#00EF7A";
+    const tr = tradeMap.get(month);
+    if (tr) {
+      const net = parseFloat(tr.net_native || 0) || (parseFloat(tr.gross || 0) - parseFloat(tr.gateway_charge || 0));
+      pendingRiskEst += getEstCommUsd(net, parseFloat(tr.exe_fee || 0), month) ?? 0;
+    }
+  });
+  const projBal = baseBalance + pendingRiskEst;
+  const projColor = projBal <= 0 ? C.red : projBal <= meta.reserve ? C.warn : C.green;
+  const paidPeriods = new Set(payouts.flatMap((p: any) => expandPeriodCovered(p.period_covered)));
   const latestConfirmed = performance.find((c: any) => c.status === "confirmed") || performance[0];
-  const latestPerf  = latestConfirmed;
   const totalPayCny = payouts.reduce((s, p) => s + parseFloat(p.cny_amount || 0), 0);
 
-  const C = { bg:"#060A12", card:"#0D1829", border:"#182840", dim:"#4A6882", text:"#C4DAF0", green:"#00EF7A", red:"#FF2847" };
-  const typeLabel: Record<string,string> = { deposit:"存入", deduct:"扣减", withdraw:"提取", commission:"提成结算" };
+  const allKnownPeriods = [currentPeriod, previousPeriod, ...performance.map((c: any) => c.period), ...tradeRecs.map((r: any) => r.period), ...[...dailyByMonth.keys()]];
+  const startPeriod = allKnownPeriods.reduce((min, p) => p < min ? p : min, currentPeriod);
+  const monthRange = (from: string, to: string) => {
+    const out: string[] = [];
+    let [y, m] = from.split("-").map(Number);
+    const [ey, em] = to.split("-").map(Number);
+    while (y < ey || (y === ey && m <= em)) { out.push(`${y}-${String(m).padStart(2, "0")}`); m++; if (m > 12) { m = 1; y++; } }
+    return out;
+  };
+  const displayMonths = monthRange(startPeriod, currentPeriod).reverse().map(period => {
+    if (confirmedPerfMap.has(period)) return { ...confirmedPerfMap.get(period), _source: "commission" };
+    const daily = dailyByMonth.get(period);
+    if (daily) return { period, status: "estimate", monthly_usd: 0, net_native: daily.net, settle_native: daily.net, exe_fee: daily.exe, _source: "daily" };
+    const tr = tradeMap.get(period);
+    if (tr) {
+      const net = parseFloat(tr.net_native || 0) || (parseFloat(tr.gross || 0) - parseFloat(tr.gateway_charge || 0));
+      return { period, status: "estimate", monthly_usd: 0, net_native: net, settle_native: net, exe_fee: parseFloat(tr.exe_fee || 0), _source: "trade" };
+    }
+    return { period, status: "pending", monthly_usd: 0, settle_native: 0, _placeholder: true };
+  });
 
-  return (
-    <div style={{ position:"fixed", inset:0, background:C.bg, color:C.text, fontFamily:"system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif", display:"flex", flexDirection:"column" }}>
+  const refresh = async () => { setRefreshing(true); await loadData(); setRefreshing(false); };
+  const handleTouchStart = (e: React.TouchEvent) => { pullStartY.current = e.touches[0].clientY; };
+  const handleTouchEnd = async (e: React.TouchEvent) => { if (e.changedTouches[0].clientY - pullStartY.current > 70 && (containerRef.current?.scrollTop || 0) <= 0 && !refreshing) await refresh(); };
+  const typeLabel: Record<string, string> = { deposit: "存入", deduct: "扣减", withdraw: "提取", commission: "提成结算" };
 
-      {/* Header */}
-      <div style={{ background:"#0A1422", borderBottom:`1px solid ${C.border}`, padding:"14px 20px 12px", flexShrink:0 }}>
-        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-          <div style={{ display:"flex", alignItems:"center", gap:12 }}>
-            <div style={{ width:42, height:42, borderRadius:"50%", background:color+"22", border:`2px solid ${color}55`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:20, fontWeight:900, color }}>
-              {meta.name[0]}
-            </div>
-            <div>
-              <div style={{ fontSize:18, fontWeight:800, color, lineHeight:1.2 }}>{meta.name}</div>
-              <div style={{ fontSize:11, color:C.dim, marginTop:1 }}>{traderId} · {meta.exchange}</div>
-            </div>
-          </div>
-          <div style={{ display:"flex", alignItems:"center", gap:8 }}>
-            {refreshing && <span style={{ fontSize:11, color:C.dim }}>刷新中…</span>}
-            <button onClick={() => { signOut(); onLogout(); }}
-              style={{ background:"transparent", border:`1px solid ${C.border}`, color:C.dim, padding:"6px 16px", borderRadius:20, cursor:"pointer", fontSize:13 }}>
-              退出
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* 主内容 */}
-      <div ref={containerRef} onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd}
-        style={{ flex:1, overflowY:"auto", padding:"16px 14px 20px" } as any}>
-
-        {refreshing && <div style={{ textAlign:"center", padding:"4px 0 10px", fontSize:12, color:C.dim }}>↻ 刷新中...</div>}
-
-        {/* ══ HOME ══ */}
-        {tab === "home" && <>
-          {/* 保证金余额 */}
-          <div style={{ background:C.card, border:`1px solid ${C.border}`, borderTop:`3px solid ${balColor}`, borderRadius:18, padding:"24px 20px 20px", marginBottom:12 }}>
-            <div style={{ fontSize:12, color:C.dim, marginBottom:10, letterSpacing:0.5 }}>💰 保证金余额</div>
-            <div style={{ fontSize:48, fontWeight:900, color:balColor, letterSpacing:-2, lineHeight:1 }}>${f2(balUsd)}</div>
-            <div style={{ fontSize:13, color:C.dim, marginTop:8 }}>
-              USD · 更新于 {lastUpdate.toLocaleTimeString("zh-CN", { hour:"2-digit", minute:"2-digit" })}
-            </div>
-            {balStatus === "warning" && (
-              <div style={{ marginTop:14, background:"#FFB30018", border:"1px solid #FFB30055", borderRadius:12, padding:"12px 14px", fontSize:14, color:"#FFB300", lineHeight:1.7 }}>
-                ⚠️ 余额低于留存警戒线<br />请联系管理员补充
-              </div>
-            )}
-            {balStatus === "danger" && (
-              <div style={{ marginTop:14, background:"#FF284718", border:"1px solid #FF284755", borderRadius:12, padding:"12px 14px", fontSize:14, color:"#FF2847", lineHeight:1.7 }}>
-                🚨 余额已耗尽<br />请立即联系管理员充值
-              </div>
-            )}
-          </div>
-
-          {/* 本月业绩 + 累计发放 */}
-          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:12 }}>
-            <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:16, padding:"18px 14px" }}>
-              <div style={{ fontSize:12, color:C.dim, marginBottom:8 }}>最新月业绩</div>
-              <div style={{ fontSize:26, fontWeight:900, color:(latestPerf?.monthly_usd||0)>=0 ? C.green : C.red, lineHeight:1 }}>
-                {(latestPerf?.monthly_usd||0)>=0 ? "+" : "−"}${f2(Math.abs(latestPerf?.monthly_usd||0))}
-              </div>
-              <div style={{ fontSize:11, color:C.dim, marginTop:6 }}>USD · {latestPerf?.period || "暂无"}</div>
-            </div>
-            <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:16, padding:"18px 14px" }}>
-              <div style={{ fontSize:12, color:C.dim, marginBottom:8 }}>累计已发放</div>
-              <div style={{ fontSize:26, fontWeight:900, color:C.green, lineHeight:1 }}>
-                ¥{Math.round(totalPayCny).toLocaleString()}
-              </div>
-              <div style={{ fontSize:11, color:C.dim, marginTop:6 }}>CNY · {payouts.length} 笔</div>
-            </div>
-          </div>
-
-          <div style={{ textAlign:"center", marginTop:12, fontSize:12, color:C.dim }}>向下拉动页面可刷新数据</div>
-        </>}
-
-        {/* ══ MONTHLY PERFORMANCE ══ */}
-        {tab === "monthly" && <>
-          <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:16, padding:"18px 16px", marginBottom:12, display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-            <div>
-              <div style={{ fontSize:12, color:C.dim, marginBottom:6 }}>最新已确认</div>
-              <div style={{ fontSize:22, fontWeight:900, color:(latestConfirmed?.monthly_usd||0)>=0?C.green:C.red }}>
-                {(latestConfirmed?.monthly_usd||0)>=0?"+":"−"}${f2(Math.abs(latestConfirmed?.monthly_usd||0))}
-              </div>
-              <div style={{ fontSize:11, color:C.dim, marginTop:4 }}>{latestConfirmed?.period || "暂无"} · USD</div>
-            </div>
-            <div>
-              <div style={{ fontSize:12, color:C.dim, marginBottom:6 }}>累计已发放</div>
-              <div style={{ fontSize:22, fontWeight:900, color:C.green }}>¥{Math.round(totalPayCny).toLocaleString()}</div>
-              <div style={{ fontSize:11, color:C.dim, marginTop:4 }}>CNY · {payouts.length} 笔</div>
-            </div>
-          </div>
-
-          <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:16, overflow:"hidden" }}>
-            <div style={{ padding:"14px 16px 10px", fontSize:13, color:C.dim, fontWeight:600 }}>所有月份业绩</div>
-            {performance.length === 0 && (
-              <div style={{ padding:"24px 16px", fontSize:13, color:C.dim, textAlign:"center" }}>暂无数据</div>
-            )}
-            {performance.map((c: any, i: number) => {
-              const pos = c.monthly_usd >= 0;
-              const isDraft = c.status !== "confirmed";
-              const hasPayout = payouts.some((p: any) => p.period_covered?.includes(c.period));
-              const statusLabel = hasPayout ? "已发放" : isDraft ? "待确认" : "计提提成";
-              const statusColor = hasPayout ? C.green : isDraft ? "#4A6882" : "#FFB300";
-              const isExpanded = expandedPeriod === c.period;
-              const d = tradeDetails[c.period];
-              return (
-                <div key={c.period} style={{ borderTop:`1px solid ${C.border}`, background: i%2 ? "#ffffff04" : "transparent", opacity: isDraft ? 0.8 : 1 }}>
-                  <div onClick={() => toggleDetail(c.period)}
-                    style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"14px 16px", cursor:"pointer" }}>
-                    <div>
-                      <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:4 }}>
-                        <span style={{ fontSize:15, fontWeight:700 }}>{c.period}</span>
-                        <span style={{ fontSize:10, padding:"2px 7px", borderRadius:10, background:statusColor+"22", color:statusColor, fontWeight:600 }}>{statusLabel}</span>
-                      </div>
-                      <div style={{ fontSize:12, color:C.dim }}>
-                        可结算 {parseFloat(c.settle_native||0).toFixed(2)} {meta.ccy}
-                      </div>
-                    </div>
-                    <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-                      <div style={{ textAlign:"right" }}>
-                        <div style={{ fontSize:22, fontWeight:900, color: isDraft ? C.dim : pos ? C.green : C.red }}>
-                          {pos ? "+" : "−"}${f2(Math.abs(c.monthly_usd))}
-                        </div>
-                        <div style={{ fontSize:11, color:C.dim, marginTop:2 }}>USD</div>
-                      </div>
-                      <span style={{ color:C.dim, fontSize:14, transition:"transform 0.2s", display:"inline-block", transform: isExpanded ? "rotate(180deg)" : "none" }}>▾</span>
-                    </div>
-                  </div>
-                  {isExpanded && (
-                    <div style={{ padding:"10px 16px 16px", background:"#ffffff06", borderTop:`1px solid ${C.border}` }}>
-                      {d === undefined && <div style={{ fontSize:12, color:C.dim }}>加载中…</div>}
-                      {d === null && <div style={{ fontSize:12, color:C.dim }}>暂无原始数据</div>}
-                      {d && (() => {
-                        const ccy = d.ccy || meta.ccy;
-                        const gross = parseFloat(d.gross || 0);
-                        const gw    = parseFloat(d.gateway_charge || 0);
-                        const net   = gross - gw;
-                        const exe   = parseFloat(d.exe_fee || 0);
-                        const isAud = ccy === "AUD";
-                        const entLabel = isAud
-                          ? "ASX 132.22 AUD + CHIXA 64.50 USD"
-                          : "HKE 451.70 HKD";
-                        const officeUsd = isAud ? 75 : 0;
-                        const fees = periodFees[c.period];
-                        const platfeeUsd = isAud ? -75 : 0;
-                        const settleN = parseFloat(c.settle_native || "0");
-                        const monthlyU = parseFloat(c.monthly_usd || "0");
-                        const backCalc = settleN !== 0 ? (monthlyU - platfeeUsd) / settleN : 0;
-                        const fxRate = c.fx_rate
-                          || (isAud ? fees?.fx_aud_usd : fees?.fx_hkd_usd)
-                          || (backCalc > 0 && backCalc < 100 ? backCalc : null);
-                        return (
-                          <div style={{ display:"grid", gap:5 }}>
-                            {[
-                              ["Gross",    gross, ccy, false],
-                              ["Gateway",  gw,    ccy, true],
-                              ["NET",      net,   ccy, false],
-                              ["Exe Fee",  exe,   ccy, true],
-                            ].map(([label, val, unit, neg]) => (
-                              <div key={label as string} style={{ display:"flex", justifyContent:"space-between", fontSize:13 }}>
-                                <span style={{ color:C.dim }}>{label}</span>
-                                <span style={{ color: label==="NET" ? (net>=0?C.green:C.red) : C.text }}>
-                                  {neg ? "−" : ""}{Math.abs(val as number).toFixed(2)} <span style={{ color:C.dim, fontSize:11 }}>{unit}</span>
-                                </span>
-                              </div>
-                            ))}
-                            {fxRate && (
-                              <div style={{ display:"flex", justifyContent:"space-between", fontSize:13, paddingTop:2 }}>
-                                <span style={{ color:C.dim }}>× 汇率 ({ccy}/USD)</span>
-                                <span style={{ color:C.text, fontWeight:600 }}>{parseFloat(fxRate).toFixed(6)}</span>
-                              </div>
-                            )}
-                            <div style={{ borderTop:`1px solid ${C.border}`, paddingTop:6, marginTop:2, display:"flex", justifyContent:"space-between", fontSize:12 }}>
-                              <span style={{ color:C.dim }}>权益扣项</span>
-                              <span style={{ color:"#FFB300" }}>{entLabel}</span>
-                            </div>
-                            {isAud && (
-                              <div style={{ display:"flex", justifyContent:"space-between", fontSize:12 }}>
-                                <span style={{ color:C.dim }}>Office Fee</span>
-                                <span style={{ color:C.text }}>−{officeUsd} <span style={{ color:C.dim, fontSize:11 }}>USD</span></span>
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })()}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </>}
-
-        {/* ══ MARGIN ══ */}
-        {tab === "margin" && <>
-          <div style={{ background:C.card, border:`1px solid ${C.border}`, borderTop:`3px solid ${balColor}`, borderRadius:18, padding:"22px 20px", marginBottom:14 }}>
-            <div style={{ fontSize:12, color:C.dim, marginBottom:8 }}>当前保证金余额</div>
-            <div style={{ fontSize:44, fontWeight:900, color:balColor, letterSpacing:-1, lineHeight:1 }}>${f2(balUsd)}</div>
-            <div style={{ fontSize:13, color:C.dim, marginTop:6 }}>USD</div>
-          </div>
-          <div style={{ fontSize:13, color:C.dim, marginBottom:10 }}>流水记录</div>
-          {ledger.filter((e:any) => e.type !== "commission").length === 0 && (
-            <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:16, padding:30, textAlign:"center", color:C.dim }}>暂无记录</div>
-          )}
-          {ledger.filter((e:any) => e.type !== "commission").map((e: any) => {
-            const isPos = e.amount_usd > 0;
-            const ec    = isPos ? C.green : "#FF2847";
-            return (
-              <div key={e.id} style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:14, padding:"14px 16px", marginBottom:8, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-                <div style={{ flex:1, marginRight:12 }}>
-                  <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:5 }}>
-                    <span style={{ fontSize:11, padding:"3px 10px", borderRadius:20, background:ec+"20", color:ec, fontWeight:700 }}>
-                      {typeLabel[e.type] || e.type}
-                    </span>
-                    <span style={{ fontSize:12, color:C.dim }}>{e.entry_date}</span>
-                  </div>
-                  {e.note && <div style={{ fontSize:13, color:C.dim, marginBottom:3 }}>{e.note}</div>}
-                  <div style={{ fontSize:12, color:C.dim }}>余额 ${f2(parseFloat(e.balance_after||0))}</div>
-                </div>
-                <div style={{ fontSize:26, fontWeight:900, color:ec, flexShrink:0 }}>
-                  {isPos ? "+" : "−"}${f2(Math.abs(e.amount_usd))}
-                </div>
-              </div>
-            );
-          })}
-        </>}
-      </div>
-
-      {/* 底部导航 */}
-      <div style={{ background:"#0A1422", borderTop:`1px solid ${C.border}`, display:"flex", flexShrink:0, paddingBottom:"env(safe-area-inset-bottom)" }}>
-        {[
-          { k:"home",    icon:"🏠", label:"首页" },
-          { k:"monthly", icon:"📊", label:"每月业绩" },
-          { k:"margin",  icon:"🏦", label:"保证金" },
-        ].map(t => (
-          <button key={t.k} onClick={() => setTab(t.k as any)}
-            style={{ flex:1, padding:"12px 0 8px", background:"transparent", border:"none", cursor:"pointer", display:"flex", flexDirection:"column", alignItems:"center", gap:3, outline:"none" }}>
-            <span style={{ fontSize:24 }}>{t.icon}</span>
-            <span style={{ fontSize:11, color: tab===t.k ? color : "#4A6882", fontWeight: tab===t.k ? 700 : 400 }}>{t.label}</span>
-            {tab === t.k && <div style={{ width:24, height:2, background:color, borderRadius:1 }} />}
-          </button>
-        ))}
-      </div>
+  return <div style={{ position: "fixed", inset: 0, background: C.bg, color: C.text, fontFamily: "system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif", display: "flex", flexDirection: "column" }}>
+    <div style={{ background: "#0A1422", borderBottom: `1px solid ${C.border}`, padding: "14px 20px 12px", flexShrink: 0 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><div style={{ display: "flex", gap: 12, alignItems: "center" }}><div style={{ width: 42, height: 42, borderRadius: "50%", background: `${meta.color}22`, border: `2px solid ${meta.color}55`, display: "flex", alignItems: "center", justifyContent: "center", color: meta.color, fontWeight: 900 }}>{meta.name[0]}</div><div><div style={{ fontSize: 18, fontWeight: 800, color: meta.color }}>{meta.name}</div><div style={{ fontSize: 11, color: C.dim }}>{traderId} · {meta.exchange}</div></div></div><button onClick={() => { signOut(); onLogout(); }} style={{ background: "transparent", border: `1px solid ${C.border}`, color: C.dim, padding: "6px 16px", borderRadius: 20 }}>退出</button></div>
     </div>
-  );
+    <div ref={containerRef} onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd} style={{ flex: 1, overflowY: "auto", padding: "16px 14px 20px" }}>
+      {refreshing && <div style={{ textAlign: "center", color: C.dim, fontSize: 12 }}>刷新中...</div>}
+      {tab === "home" && <>
+        <div style={{ background: C.card, border: `1px solid ${C.border}`, borderTop: `3px solid ${projColor}`, borderRadius: 18, padding: "24px 20px 20px", marginBottom: 12 }}><div style={{ fontSize: 12, color: C.dim, marginBottom: 10 }}>预估月末余额</div><div style={{ fontSize: 48, fontWeight: 900, color: projColor, lineHeight: 1 }}>${f2(projBal)}</div><div style={{ fontSize: 13, color: C.dim, marginTop: 8 }}>USD · 更新于 {lastUpdate.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</div></div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12 }}><div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, padding: "18px 14px" }}><div style={{ fontSize: 12, color: C.dim, marginBottom: 8 }}>本月业绩</div>{(() => { const c = confirmedPerfMap.get(currentPeriod); const d = dailyByMonth.get(currentPeriod); const tr = tradeMap.get(currentPeriod); const net = tr ? (parseFloat(tr.gross || 0) - parseFloat(tr.gateway_charge || 0)) : d?.net ?? 0; const est = c ? parseFloat(c.monthly_usd || 0) : d ? getEstCommUsd(d.net, d.exe, currentPeriod) : tr ? getEstCommUsd(net, parseFloat(tr.exe_fee || 0), currentPeriod) : null; return est !== null ? <><div style={{ fontSize: 26, fontWeight: 900, color: est >= 0 ? C.green : C.red }}>{est >= 0 ? "+" : "-"}${f2(est)}</div><div style={{ fontSize: 11, color: C.dim, marginTop: 6 }}>{currentPeriod} · {c ? "已核对" : "预估"}</div></> : <><div style={{ fontSize: 22, color: C.dim }}>-</div><div style={{ fontSize: 11, color: C.dim }}>暂无数据</div></>; })()}</div><div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, padding: "18px 14px" }}><div style={{ fontSize: 12, color: C.dim, marginBottom: 8 }}>累计已发放</div><div style={{ fontSize: 26, fontWeight: 900, color: C.green }}>¥{Math.round(totalPayCny).toLocaleString()}</div><div style={{ fontSize: 11, color: C.dim, marginTop: 6 }}>CNY · {payouts.length} 笔</div></div></div>
+      </>}
+      {tab === "monthly" && <>
+        <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, padding: "18px 16px", marginBottom: 12, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}><div><div style={{ fontSize: 12, color: C.dim, marginBottom: 6 }}>最新已核对</div><div style={{ fontSize: 22, fontWeight: 900, color: parseFloat(latestConfirmed?.monthly_usd || 0) >= 0 ? C.green : C.red }}>{parseFloat(latestConfirmed?.monthly_usd || 0) >= 0 ? "+" : "-"}${f2(parseFloat(latestConfirmed?.monthly_usd || 0))}</div><div style={{ fontSize: 11, color: C.dim }}>{latestConfirmed?.period || "暂无"} · USD</div></div><div><div style={{ fontSize: 12, color: C.dim, marginBottom: 6 }}>累计已发放</div><div style={{ fontSize: 22, fontWeight: 900, color: C.green }}>¥{Math.round(totalPayCny).toLocaleString()}</div><div style={{ fontSize: 11, color: C.dim }}>CNY · {payouts.length} 笔</div></div></div>
+        <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, overflow: "hidden" }}><div style={{ padding: "14px 16px 10px", fontSize: 13, color: C.dim, fontWeight: 600 }}>所有月份业绩</div>{displayMonths.map((c: any, i) => { const isPlaceholder = !!c._placeholder; const isEstimate = c._source === "daily" || c._source === "trade"; const isPaid = paidPeriods.has(c.period); const isConfirmed = c.status === "confirmed"; const statusLabel = isPaid ? "已发放" : isConfirmed ? "已核对" : isEstimate ? "预估" : "待核对"; const statusColor = isPaid ? C.green : isConfirmed ? C.blue : isEstimate ? C.blue : C.warn; const net = parseFloat(c.net_native || c.settle_native || 0); const exe = parseFloat(c.exe_fee || 0); const est = isEstimate ? getEstCommUsd(net, exe, c.period) : parseFloat(c.monthly_usd || 0); const expanded = expandedPeriod === c.period; return <div key={c.period} style={{ borderTop: `1px solid ${C.border}`, background: i % 2 ? "#ffffff04" : "transparent", opacity: isPlaceholder ? 0.5 : 1 }}><div onClick={() => !isPlaceholder && setExpandedPeriod(expanded ? null : c.period)} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 16px", cursor: isPlaceholder ? "default" : "pointer" }}><div><div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}><span style={{ fontSize: 15, fontWeight: 700 }}>{c.period}</span><span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 10, background: `${statusColor}22`, color: statusColor, fontWeight: 600 }}>{statusLabel}</span></div><div style={{ fontSize: 12, color: C.dim }}>{isPlaceholder ? "暂无数据" : `NET ${net >= 0 ? "+" : "-"}${f2(net)} ${meta.ccy}`}</div></div><div style={{ textAlign: "right" }}>{isPlaceholder ? <div style={{ color: C.dim }}>-</div> : est !== null ? <><div style={{ fontSize: 20, fontWeight: 900, color: isEstimate ? (est >= 0 ? C.green : C.red) : !isConfirmed ? C.dim : est >= 0 ? C.green : C.red }}>{isEstimate ? "~" : ""}{est >= 0 ? "+" : "-"}${f2(est)}</div><div style={{ fontSize: 11, color: C.dim }}>USD</div></> : <div style={{ color: C.dim }}>待录汇率</div>}</div></div>{expanded && !isPlaceholder && <div style={{ padding: "10px 16px 16px", background: "#ffffff06", borderTop: `1px solid ${C.border}`, display: "grid", gap: 6 }}><div style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}><span style={{ color: C.dim }}>NET</span><span style={{ color: net >= 0 ? C.green : C.red }}>{net >= 0 ? "+" : "-"}{f2(net)} {meta.ccy}</span></div><div style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}><span style={{ color: C.dim }}>Exe Fee</span><span>{f2(exe)} {meta.ccy}</span></div>{est !== null && <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}><span style={{ color: C.dim }}>业绩提成</span><span style={{ color: est >= 0 ? C.green : C.red }}>{est >= 0 ? "+" : "-"}${f2(est)}</span></div>}</div>}</div>; })}</div>
+      </>}
+      {tab === "margin" && <>
+        <div style={{ background: C.card, border: `1px solid ${C.border}`, borderTop: `3px solid ${baseBalance <= 0 ? C.red : baseBalance <= meta.reserve ? C.warn : C.green}`, borderRadius: 18, padding: "22px 20px", marginBottom: 14 }}><div style={{ fontSize: 12, color: C.dim, marginBottom: 8 }}>账户余额</div><div style={{ fontSize: 44, fontWeight: 900, color: baseBalance <= 0 ? C.red : baseBalance <= meta.reserve ? C.warn : C.green }}>${f2(baseBalance)}</div><div style={{ fontSize: 13, color: C.dim }}>USD</div></div>
+        <div style={{ fontSize: 13, color: C.dim, marginBottom: 10 }}>流水记录</div>{ledger.map((e: any) => { const amt = parseFloat(e.amount_usd || 0); const isPos = amt >= 0; return <div key={e.id || `${e.entry_date}-${e.note}`} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: "14px 16px", marginBottom: 10 }}><div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}><div><div style={{ fontSize: 13, color: C.dim }}>{e.entry_date}</div><div style={{ fontSize: 15, fontWeight: 700 }}>{typeLabel[e.type] || e.type}</div></div><div style={{ textAlign: "right" }}><div style={{ fontSize: 18, fontWeight: 900, color: isPos ? C.green : C.red }}>{isPos ? "+" : "-"}${f2(amt)}</div>{e.balance_after !== null && e.balance_after !== undefined && <div style={{ fontSize: 12, color: C.dim }}>余额 ${f2(parseFloat(e.balance_after))}</div>}</div></div>{e.note && <div style={{ fontSize: 12, color: C.dim }}>{e.note}</div>}</div>; })}</>}
+    </div>
+    <div style={{ flexShrink: 0, background: "#0A1422", borderTop: `1px solid ${C.border}`, display: "grid", gridTemplateColumns: "repeat(3, 1fr)", padding: "6px 0 max(6px, env(safe-area-inset-bottom))" }}>{[{ k: "home", label: "首页" }, { k: "monthly", label: "每月业绩" }, { k: "margin", label: "保证金" }].map(item => <button key={item.k} onClick={() => setTab(item.k as any)} style={{ background: "transparent", border: "none", color: tab === item.k ? meta.color : C.dim, padding: "8px 4px", fontSize: 12, fontWeight: tab === item.k ? 700 : 500 }}>{item.label}</button>)}</div>
+  </div>;
 }
