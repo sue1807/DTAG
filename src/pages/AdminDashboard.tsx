@@ -451,82 +451,46 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
   };
 
   // ── Settlement screenshot preview & OCR ────────────────────────
-  const handleImgUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+  const handleImgUpload = async (e: React.ChangeEvent<HTMLInputElement> | any) => {
+    let file = e.target?.files?.[0];
     if (!file) return;
+
     const url = URL.createObjectURL(file);
     setSettlImg(url);
-    console.log("📸 上传了截图:", file.name, "大小:", file.size);
     showToast("✓ 截图已上传，正在识别...");
 
     try {
-      // 动态导入 Tesseract 以避免模块加载问题
-      const Tesseract = (await import("tesseract.js")).default;
-      console.log("Tesseract 已加载");
+      // 直接调用后端 OCR API
+      const formData = new FormData();
+      formData.append("file", file);
 
-      const worker = await Tesseract.createWorker();
-      console.log("Worker 创建中...");
+      const response = await fetch("http://localhost:18765/ocr", {
+        method: "POST",
+        body: formData,
+      });
 
-      const { data: { text } } = await worker.recognize(file);
-      console.log("OCR 识别结果:\n", text);
-      await worker.terminate();
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-      // 提取数字的辅助函数
-      const toNum = (s: string) => {
-        const n = parseFloat(s.replace(/[,\s]/g, ""));
-        return isNaN(n) ? null : n;
-      };
+      const result = await response.json();
+      console.log("OCR 识别结果:", result);
 
-      // 更灵活的匹配 - 支持多种格式
-      const patterns = {
-        equity_aud: [
-          /Equity[\s\n]+AUD[\s\n]+([\d,]+\.?\d*)/i,
-          /Equity.*?([\d,]+\.?\d*)/i,
-        ],
-        cut_aud: [
-          /Cut.*?Equity[\s\n]+([\d,]+\.?\d*)/i,
-          /Cut.*?([\d,]+\.?\d*)/i,
-        ],
-        net_aud: [
-          /Net.*?Equity[\s\n]+([\d,]+\.?\d*)/i,
-          /Net[\s\n]+([\d,]+\.?\d*)/i,
-        ],
-        exe_aud: [
-          /Total.*?Transaction.*?Fees?[\s\n]+([-\d,]+\.?\d*)/i,
-          /Transaction.*?Fees?[\s\n]+([-\d,]+\.?\d*)/i,
-        ],
-      };
-
-      const extracted: any = {};
-      for (const [key, patternList] of Object.entries(patterns)) {
-        for (const pattern of patternList as RegExp[]) {
-          const match = text.match(pattern);
-          if (match) {
-            extracted[key] = toNum(match[1]);
-            console.log(`✓ ${key}: ${match[1]} → ${extracted[key]}`);
-            break;
-          }
-        }
-      }
-
-      if (Object.keys(extracted).length > 0) {
+      if (result.success && result.data) {
+        const data = result.data;
         setSForm((p: any) => ({
           ...p,
-          equity_aud: extracted.equity_aud ?? p.equity_aud,
-          cut_aud: extracted.cut_aud ?? p.cut_aud,
-          net_aud: extracted.net_aud ?? p.net_aud,
-          exe_aud: extracted.exe_aud ?? p.exe_aud,
+          equity_aud: data.equity_aud ?? p.equity_aud,
+          cut_aud: data.cut_aud ?? p.cut_aud,
+          net_aud: data.net_aud ?? p.net_aud,
+          exe_aud: data.exe_aud ?? p.exe_aud,
         }));
         showToast("✓ 截图识别完成，已自动填入数据");
       } else {
-        showToast("⚠ 未能识别表格数据，请检查截图内容", false);
+        showToast("⚠ 未能识别表格数据: " + (result.error || "未知错误"), false);
       }
     } catch (err: any) {
-      console.error("❌ 识别错误:", err);
+      console.error("识别错误:", err);
       showToast("识别失败: " + err.message, false);
     }
-
-    if (e.target) e.target.value = "";
   };
 
   // ── Settlement PDF ────────────────────────────────────────
@@ -1677,22 +1641,23 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                     <button onClick={() => { setSForm({...emptySForm, period}); settlPdfRef.current?.click(); }} style={{...ghostBtn(), fontSize:12, padding:"5px 9px"}} disabled={pdfParsing}>
                       {pdfParsing ? "解析…" : "↑ PDF"}
                     </button>
-                    <button onClick={() => {
-                      console.log("❌ 点击了截图按钮");
+                    <button onClick={async () => {
                       const input = document.createElement("input");
                       input.type = "file";
                       input.accept = "image/*";
-                      input.onchange = (e: any) => {
-                        console.log("✓ input change 事件触发");
-                        const file = e.target.files?.[0];
-                        if (file) {
-                          console.log("📸 获取到文件:", file.name);
-                          setSForm({...emptySForm, period});
-                          setSettlView("edit");
-                          handleImgUpload(e);
-                        }
-                      };
-                      input.click();
+
+                      await new Promise<void>((resolve) => {
+                        input.addEventListener("change", (e: any) => {
+                          const file = input.files?.[0];
+                          if (file) {
+                            setSForm({...emptySForm, period});
+                            setSettlView("edit");
+                            handleImgUpload(e as any);
+                          }
+                          resolve();
+                        }, { once: true });
+                        input.click();
+                      });
                     }} style={{...ghostBtn(), fontSize:12, padding:"5px 9px"}}>
                       🖼 截图
                     </button>
