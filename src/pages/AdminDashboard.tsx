@@ -1674,11 +1674,23 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                       {MONTHS.map(p => <option key={p}>{p}</option>)}
                     </select>
                     <input type="file" accept=".pdf" ref={settlPdfRef} onChange={handlePdfUpload} style={{ display:"none" }} />
-                    <input type="file" accept="image/*" id="settlImgUpload" onChange={(e) => { handleImgUpload(e); setSForm({...emptySForm, period}); setSettlView("edit"); }} style={{ display:"none" }} />
                     <button onClick={() => { setSForm({...emptySForm, period}); settlPdfRef.current?.click(); }} style={{...ghostBtn(), fontSize:12, padding:"5px 9px"}} disabled={pdfParsing}>
                       {pdfParsing ? "解析…" : "↑ PDF"}
                     </button>
-                    <button onClick={() => { setSForm({...emptySForm, period}); (document.getElementById("settlImgUpload") as HTMLInputElement)?.click(); }} style={{...ghostBtn(), fontSize:12, padding:"5px 9px"}}>
+                    <button onClick={async () => {
+                      const input = document.createElement("input");
+                      input.type = "file";
+                      input.accept = "image/*";
+                      input.onchange = async (e) => {
+                        const file = (e.target as HTMLInputElement).files?.[0];
+                        if (file) {
+                          setSForm({...emptySForm, period});
+                          setSettlView("edit");
+                          await handleImgUpload({target: {files: [file]}} as any);
+                        }
+                      };
+                      input.click();
+                    }} style={{...ghostBtn(), fontSize:12, padding:"5px 9px"}}>
                       🖼 截图
                     </button>
                     <button onClick={triggerSettlFetch} style={{...ghostBtn(), fontSize:12, padding:"5px 9px"}} disabled={fetchingSettl}>
