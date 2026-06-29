@@ -450,12 +450,29 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
     setLoading(false);
   };
 
-  // ── Settlement screenshot preview ────────────────────────
-  const handleImgUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // ── Settlement screenshot preview & OCR ────────────────────────
+  const handleImgUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]; if (!file) return;
     const url = URL.createObjectURL(file);
     setSettlImg(url);
-    showToast("截图已加载，对照图片填写下方数据");
+    setLoading(true);
+    try {
+      const Tesseract = (window as any).Tesseract;
+      if (!Tesseract) throw new Error("Tesseract.js not loaded");
+      const { data: { text } } = await Tesseract.recognize(file, 'chi_sim');
+      const g = (pattern: RegExp) => { const m = text.match(pattern); return m ? toNum(m[1]) : null; };
+      setSForm((p: any) => ({
+        ...p,
+        equity_aud: g(/(?:Equity|股权)\s+([\d,]+\.?\d*)/) ?? p.equity_aud,
+        cut_aud: g(/(?:Cut|扣除).*?15%\s+([\d,]+\.?\d*)/) ?? p.cut_aud,
+        net_aud: g(/(?:Net|净值).*?85%\s+([\d,]+\.?\d*)/) ?? p.net_aud,
+        exe_aud: g(/(?:Transaction|交易).*?fees?\s+([\d,]+\.?\d*)/) ?? p.exe_aud,
+      }));
+      showToast("✓ 截图 OCR 识别成功，已填入 AUD 数据");
+    } catch (err: any) {
+      showToast("OCR 识别失败: " + err.message, false);
+    }
+    setLoading(false);
     if (e.target) e.target.value = "";
   };
 
