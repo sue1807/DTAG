@@ -1942,16 +1942,8 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                     </span>
                   )}
                   <input type="file" accept=".pdf" onChange={handlePdfUpload} style={{display:"none"}} id="pdf-upload-input" />
-                  <button onClick={async () => {
-                    const input = document.createElement("input");
-                    input.type = "file";
-                    input.accept = "image/*";
-                    input.onchange = async (e) => {
-                      const file = (e.target as HTMLInputElement).files?.[0];
-                      if (file) await handleImgUpload({target: {files: [file]}} as any);
-                    };
-                    input.click();
-                  }} style={ghostBtn()}>🖼 上传截图</button>
+                  <input type="file" accept="image/*" onChange={(e) => { if(e.target.files?.[0]) { console.log("图片上传"); handleImgUpload(e as any); }}} style={{display:"none"}} id="img-upload-input" />
+                  <button onClick={() => { console.log("点击上传截图"); (document.getElementById("img-upload-input") as HTMLInputElement)?.click(); }} style={ghostBtn()}>🖼 上传截图</button>
                   <button onClick={()=>(document.getElementById("pdf-upload-input") as HTMLInputElement)?.click()} style={filledBtn(C.blue)} disabled={pdfParsing}>📄 上传 PDF</button>
                   <button onClick={()=>{ setSForm({...emptySForm, period}); setSettlImg(null); setSettlementMatchStatus(null); }} style={ghostBtn()}>清空</button>
                 </div>
