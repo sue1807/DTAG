@@ -184,6 +184,7 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
   const [fetchingSettl, setFetchingSettl] = useState(false);
   const [selectedSettlPeriod, setSelectedSettlPeriod] = useState<string | null>(null);
   const [settling, setSettling] = useState(false);
+  const [settlementMatchStatus, setSettlementMatchStatus] = useState<{ match: boolean; differences: string[] } | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const pdfRef  = useRef<HTMLInputElement>(null);
 
@@ -464,40 +465,41 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
     setPdfParsing(true);
     try {
       const parsed = await parsePdf(file);
-      const parsedPe = parsed.payment_exchange ?? [];
-      const targetPeriod = sForm.period || period;
-      const savedPe = settlements.find((s: any) => s.period === targetPeriod)?.payment_exchange ?? [];
-      const currentPe = hasPaymentExchange(savedPe) ? savedPe : (sForm.payment_exchange ?? []);
-      const protectPaymentExchange = hasPaymentExchange(currentPe);
-      const peDiff = paymentExchangeDiffers(currentPe, parsedPe);
-      setSForm((p: any) => ({
-        ...p,
-        equity_aud: parsed.equity_aud?.toString() ?? p.equity_aud,
-        cut_aud: parsed.cut_aud?.toString() ?? p.cut_aud,
-        net_aud: parsed.net_aud?.toString() ?? p.net_aud,
-        exe_aud: parsed.exe_aud?.toString() ?? p.exe_aud,
-        equity_hkd: parsed.equity_hkd?.toString() ?? p.equity_hkd,
-        cut_hkd: parsed.cut_hkd?.toString() ?? p.cut_hkd,
-        net_hkd: parsed.net_hkd?.toString() ?? p.net_hkd,
-        exe_hkd: parsed.exe_hkd?.toString() ?? p.exe_hkd,
-        post_exchange_aud: parsed.post_exchange_aud?.toString() ?? p.post_exchange_aud,
-        post_exchange_hkd: parsed.post_exchange_hkd?.toString() ?? p.post_exchange_hkd,
-        post_exchange_usd: parsed.post_exchange_usd?.toString() ?? p.post_exchange_usd,
-        wire_fees_usd: parsed.wire_fees_usd?.toString() ?? p.wire_fees_usd,
-        loss_coverage: parsed.loss_coverage?.length ? parsed.loss_coverage : p.loss_coverage,
-        payment_exchange: hasPaymentExchange(savedPe) ? savedPe : (hasPaymentExchange(p.payment_exchange) ? p.payment_exchange : (hasPaymentExchange(parsedPe) ? parsedPe : p.payment_exchange)),
-        erp_deposits: parsed.erp_deposits?.length ? parsed.erp_deposits : p.erp_deposits,
-        erp_withdrawals: parsed.erp_withdrawals?.length ? parsed.erp_withdrawals : p.erp_withdrawals,
-      }));
-      if (!protectPaymentExchange && hasPaymentExchange(parsedPe)) {
-        const { fxAudUsd, fxHkdUsd } = derivePaymentExchangeFx(parsedPe);
-        if (fxAudUsd) setFForm((p: any) => ({ ...p, fx_aud_usd: fxAudUsd.toFixed(8) }));
-        if (fxHkdUsd) setFForm((p: any) => ({ ...p, fx_hkd_usd: fxHkdUsd.toFixed(8) }));
-        setFxSrc({ aud: fxAudUsd ? "pdf" : "", hkd: fxHkdUsd ? "pdf" : "" });
+      const differences: string[] = [];
+
+      // 比对关键字段
+      const fieldsToCompare: [string, string][] = [
+        ["equity_aud", "AUD Equity"],
+        ["cut_aud", "AUD Cut 15%"],
+        ["net_aud", "AUD Net 85%"],
+        ["exe_aud", "AUD Transaction Fees"],
+        ["equity_hkd", "HKD Equity"],
+        ["cut_hkd", "HKD Cut 15%"],
+        ["net_hkd", "HKD Net 85%"],
+        ["exe_hkd", "HKD Transaction Fees"],
+        ["post_exchange_usd", "Post Exchange USD"],
+      ];
+
+      for (const [field, label] of fieldsToCompare) {
+        const currentVal = parseFloat(sForm[field] || "0");
+        const pdfVal = parseFloat(parsed[field] || "0");
+        if (Math.abs(currentVal - pdfVal) > 0.01) {
+          differences.push(`${label}: 截图=${currentVal} vs PDF=${pdfVal}`);
+        }
       }
-      showToast(peDiff ? "PDF Payment Exchange 与当前已确认值不同，已保留当前值" : "PDF 解析成功");
+
+      const isMatch = differences.length === 0;
+      setSettlementMatchStatus({ match: isMatch, differences });
+
+      // 只在有差异时提示
+      if (!isMatch) {
+        showToast(`PDF 核对发现差异（${differences.length} 项）`, false);
+      } else {
+        showToast("✓ PDF 数据与截图识别数据完全匹配");
+      }
+
       setSettlView("edit");
-    } catch (err: any) { showToast("解析失败: " + err.message, false); }
+    } catch (err: any) { showToast("PDF 解析失败: " + err.message, false); }
     setPdfParsing(false);
     if (pdfRef.current) pdfRef.current.value = "";
     if (settlPdfRef.current) settlPdfRef.current.value = "";
@@ -1877,28 +1879,41 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
               );
             })()}
             <div style={{...card, borderColor:`${C.blue}40`}}>
-              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom: settlImg ? 16 : 0 }}>
+              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom: settlImg || settlementMatchStatus ? 16 : 0 }}>
                 <div>
-                  <div style={{ fontSize:15, fontWeight:700, marginBottom:4 }}>上传截图参考 / PDF 自动解析</div>
-                  <div style={{ fontSize:13, color:C.muted }}>截图上传后在下方显示，对照填写。PDF 上传后自动解析填入。</div>
+                  <div style={{ fontSize:15, fontWeight:700, marginBottom:4 }}>上传截图参考 / PDF 核对</div>
+                  <div style={{ fontSize:13, color:C.muted }}>截图上传后在下方显示，对照填写。PDF 上传后自动对比验证数据一致性。</div>
                 </div>
                 <div style={{ display:"flex", gap:10, alignItems:"center" }}>
                   {pdfParsing&&<span style={{fontSize:13,color:C.blue}}>解析中…</span>}
+                  {settlementMatchStatus && (
+                    <span style={{ fontSize:12, padding:"4px 12px", borderRadius:6, background: settlementMatchStatus.match ? `${C.green}22` : `${C.red}22`, color: settlementMatchStatus.match ? C.green : C.red, fontWeight:700 }}>
+                      {settlementMatchStatus.match ? "✓ 数据匹配" : `✗ 发现 ${settlementMatchStatus.differences.length} 项差异`}
+                    </span>
+                  )}
                   <input type="file" accept="image/*" ref={pdfRef} onChange={handleImgUpload} style={{display:"none"}} />
                   <input type="file" accept=".pdf" onChange={handlePdfUpload} style={{display:"none"}} id="pdf-upload-input" />
                   <button onClick={()=>pdfRef.current?.click()} style={ghostBtn()}>🖼 上传截图</button>
                   <button onClick={()=>(document.getElementById("pdf-upload-input") as HTMLInputElement)?.click()} style={filledBtn(C.blue)} disabled={pdfParsing}>📄 上传 PDF</button>
-                  <button onClick={()=>{ setSForm({...emptySForm, period}); setSettlImg(null); }} style={ghostBtn()}>清空</button>
+                  <button onClick={()=>{ setSForm({...emptySForm, period}); setSettlImg(null); setSettlementMatchStatus(null); }} style={ghostBtn()}>清空</button>
                 </div>
               </div>
               {settlImg && (
-                <div style={{ position:"relative" }}>
+                <div style={{ position:"relative", marginBottom:16 }}>
                   <img src={settlImg} alt="settlement screenshot"
                     style={{ width:"100%", borderRadius:8, border:`1px solid ${C.border}`, maxHeight:500, objectFit:"contain", background:"#000" }} />
                   <button onClick={()=>setSettlImg(null)}
                     style={{ position:"absolute", top:8, right:8, background:"rgba(0,0,0,0.6)", border:"none", color:"#fff", borderRadius:20, padding:"4px 10px", cursor:"pointer", fontSize:12 }}>
                     × 关闭
                   </button>
+                </div>
+              )}
+              {settlementMatchStatus && settlementMatchStatus.differences.length > 0 && (
+                <div style={{ ...card, padding:"12px 16px", marginBottom:16, background:`${C.red}08`, border:`1px solid ${C.red}40` }}>
+                  <div style={{ fontSize:13, fontWeight:600, color:C.red, marginBottom:8 }}>PDF 核对差异：</div>
+                  {settlementMatchStatus.differences.map((diff, i) => (
+                    <div key={i} style={{ fontSize:12, color:C.muted, marginBottom:4 }}>• {diff}</div>
+                  ))}
                 </div>
               )}
             </div>
