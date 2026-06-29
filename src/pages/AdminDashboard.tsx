@@ -458,27 +458,29 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
     setSettlImg(url);
     setLoading(true);
     try {
-      console.log("Starting OCR...");
-      const { data: { text } } = await Tesseract.recognize(file, 'eng');
+      console.log("Starting OCR with file:", file.name);
+      const worker = await Tesseract.createWorker();
+      const { data: { text } } = await worker.recognize(file);
+      await worker.terminate();
       console.log("OCR 结果:", text);
       const toNum2 = (s: string) => { const n = parseFloat(s.replace(/,/g, "")); return isNaN(n) ? null : n; };
       const extractValue = (text: string, pattern: RegExp) => {
         const match = text.match(pattern);
-        if (match) { console.log("匹配到:", pattern, match[1]); return toNum2(match[1]); }
+        if (match) { console.log("匹配到:", pattern, "值:", match[1]); return toNum2(match[1]); }
         return null;
       };
       setSForm((p: any) => {
         const updated = {
           ...p,
           equity_aud: extractValue(text, /Equity\s+([\d,]+\.?\d*)/) ?? p.equity_aud,
-          cut_aud: extractValue(text, /Cut for Equity\s+([\d,]+\.?\d*)/) ?? p.cut_aud,
-          net_aud: extractValue(text, /Net for Equity\s+([\d,]+\.?\d*)/) ?? p.net_aud,
-          exe_aud: extractValue(text, /Total Transaction Fees\s+([-\d,]+\.?\d*)/) ?? p.exe_aud,
+          cut_aud: extractValue(text, /Cut\s+for\s+Equity\s+([\d,]+\.?\d*)/) ?? p.cut_aud,
+          net_aud: extractValue(text, /Net\s+for\s+Equity\s+([\d,]+\.?\d*)/) ?? p.net_aud,
+          exe_aud: extractValue(text, /Total\s+Transaction\s+Fees\s+([-\d,]+\.?\d*)/) ?? p.exe_aud,
         };
         console.log("更新表单:", updated);
         return updated;
       });
-      showToast("✓ 截图 OCR 识别完成，请检查表单是否自动填入");
+      showToast("✓ 截图 OCR 识别完成");
     } catch (err: any) {
       console.error("OCR 错误:", err);
       showToast("OCR 识别失败: " + err.message, false);
