@@ -1,3 +1,9 @@
 node_modules/
 .env
 *.local
+.claude/
+dist/
+scripts/__pycache__/
+scripts/*.log
+scripts/metro_cookies.json
+*.pyc
