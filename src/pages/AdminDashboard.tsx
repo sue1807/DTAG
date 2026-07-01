@@ -989,12 +989,44 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
     const period = `${year}-${String(month).padStart(2, "0")}`;
     setLoading(true);
     try {
+      // 1. 标记该月 daily_performance 为已锁定
       const { error } = await supabase.from("daily_performance")
         .update({ is_confirmed: true })
         .like("trade_date", `${period}%`);
       if (error) throw error;
-      showToast(`✓ ${period} 数据已锁定`);
+
+      // 2. 汇总该月 daily_performance → trade_records（供提成计算），按交易员累加
+      const { data: dp } = await supabase.from("daily_performance").select("*").like("trade_date", `${period}%`);
+      const nameToId: Record<string, string> = {};
+      for (const [id, cfg] of Object.entries(TRADERS)) nameToId[(cfg as any).name] = id;
+      const resolveId = (tn: string) => (TRADERS as any)[tn] ? tn : (nameToId[tn] || tn);
+      const agg: Record<string, any> = {};
+      for (const row of dp || []) {
+        const tid = resolveId(row.trader_name);
+        if (!(TRADERS as any)[tid]) continue;
+        if (!agg[tid]) agg[tid] = { trader_id: tid, period, gross: 0, gateway_charge: 0, exe_fee: 0, sec_fee: 0, ccy: (TRADERS as any)[tid].ccy, source_file: `daily_lock_${period}` };
+        agg[tid].gross += parseFloat(row.gross) || 0;
+        agg[tid].gateway_charge += parseFloat(row.gateway_charge) || 0;
+        agg[tid].exe_fee += parseFloat(row.exe_fee) || 0;
+        agg[tid].sec_fee += parseFloat(row.sec_fee) || 0;
+      }
+      const aggRows = Object.values(agg);
+      aggRows.forEach((r: any) => {
+        r.gross = Math.round(r.gross * 10000) / 10000;
+        r.gateway_charge = Math.round(r.gateway_charge * 10000) / 10000;
+        r.exe_fee = Math.round(r.exe_fee * 10000) / 10000;
+        r.sec_fee = Math.round(r.sec_fee * 10000) / 10000;
+      });
+      // 已确认月份不覆盖，保护已锁定的提成基础
+      const { data: locked } = await supabase.from("commission_results")
+        .select("trader_id").eq("period", period).eq("status", "confirmed").limit(1);
+      if (aggRows.length > 0 && !locked?.length) {
+        await supabase.from("trade_records").upsert(aggRows, { onConflict: "trader_id,period" });
+      }
+
+      showToast(`✓ ${period} 数据已锁定${aggRows.length && !locked?.length ? `并汇总（${aggRows.length} 位交易员）` : ""}`);
       loadDailyData(dailyFilter.dateFrom, dailyFilter.dateTo);
+      reload();
     } catch (e: any) {
       showToast("数据锁定失败: " + e.message, false);
     }
