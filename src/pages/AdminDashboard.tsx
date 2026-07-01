@@ -159,6 +159,8 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
   const [verify, setVerify]           = useState<any>(null);
   const [preview, setPreview]         = useState<any>(null);
   const [loading, setLoading]         = useState(false);
+  const [pdfParsing, setPdfParsing]   = useState(false);
+  const [settlImg, setSettlImg]       = useState<string|null>(null);
   const [toast, setToast]             = useState<{ msg: string; ok: boolean } | null>(null);
   const [confirmDlg, setConfirmDlg]   = useState<{ msg: string; onOk: () => void } | null>(null);
   const [tradePage, setTradePage]     = useState(0);
@@ -180,7 +182,11 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
   const [fetchingSettl, setFetchingSettl] = useState(false);
   const [selectedSettlPeriod, setSelectedSettlPeriod] = useState<string | null>(null);
   const [settling, setSettling] = useState(false);
+  const [settlementMatchStatus, setSettlementMatchStatus] = useState<{ match: boolean; differences: string[] } | null>(null);
+  const settlPdfRef = useRef<HTMLInputElement>(null);
+  const settlImgRef = useRef<HTMLInputElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const pdfRef  = useRef<HTMLInputElement>(null);
 
   // Dynamic month list: 2025-11 → today + 8 months
   const MONTHS = (() => {
@@ -444,6 +450,87 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
     setLoading(false);
   };
 
+  // ── Settlement screenshot preview & OCR ────────────────────────
+  const handleImgUpload = async (e: React.ChangeEvent<HTMLInputElement> | any) => {
+    let file = e.target?.files?.[0];
+    if (!file) return;
+
+    const url = URL.createObjectURL(file);
+    setSettlImg(url);
+    showToast("✓ 截图已上传，正在识别...");
+
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        const base64Data = reader.result;
+        const response = await fetch("http://localhost:18765/ocr", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ image: base64Data }),
+        });
+        if (!response.ok) throw new Error(`OCR 服务错误: ${response.status}`);
+        const result = await response.json();
+        console.log("OCR 识别结果:", result);
+        if (result.success && result.data) {
+          const data = result.data;
+          setSForm((p: any) => {
+            const updated = { ...p };
+            for (const [key, value] of Object.entries(data)) {
+              if (value !== null) updated[key] = value;
+            }
+            return updated;
+          });
+          const fieldCount = Object.values(data).filter(v => v !== null).length;
+          showToast(`✓ 识别成功，共识别 ${fieldCount} 个字段`);
+        } else {
+          showToast("⚠ 未能识别表格数据: " + (result.error || "未知错误"), false);
+        }
+      } catch (err: any) {
+        console.error("识别错误:", err);
+        showToast("识别失败: " + err.message, false);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // ── Settlement PDF ────────────────────────────────────────
+  const handlePdfUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]; if (!file) return;
+    setPdfParsing(true);
+    try {
+      const parsed = await parsePdf(file);
+      const differences: string[] = [];
+      const fieldsToCompare: [string, string][] = [
+        ["equity_aud", "AUD Equity"],
+        ["cut_aud", "AUD Cut 15%"],
+        ["net_aud", "AUD Net 85%"],
+        ["exe_aud", "AUD Transaction Fees"],
+        ["equity_hkd", "HKD Equity"],
+        ["cut_hkd", "HKD Cut 15%"],
+        ["net_hkd", "HKD Net 85%"],
+        ["exe_hkd", "HKD Transaction Fees"],
+        ["post_exchange_usd", "Post Exchange USD"],
+      ];
+      for (const [field, label] of fieldsToCompare) {
+        const currentVal = parseFloat(sForm[field] || "0");
+        const pdfVal = parseFloat(parsed[field] || "0");
+        if (Math.abs(currentVal - pdfVal) > 0.01) {
+          differences.push(`${label}: 截图=${currentVal} vs PDF=${pdfVal}`);
+        }
+      }
+      const isMatch = differences.length === 0;
+      setSettlementMatchStatus({ match: isMatch, differences });
+      if (!isMatch) {
+        showToast(`PDF 核对发现差异（${differences.length} 项）`, false);
+      } else {
+        showToast("✓ PDF 数据与截图识别数据完全匹配");
+      }
+      setSettlView("edit");
+    } catch (err: any) { showToast("PDF 解析失败: " + err.message, false); }
+    setPdfParsing(false);
+    if (pdfRef.current) pdfRef.current.value = "";
+    if (settlPdfRef.current) settlPdfRef.current.value = "";
+  };
 
   // ── Trigger settlement PDF fetch via local server ─────────
   const triggerSettlFetch = async () => {
