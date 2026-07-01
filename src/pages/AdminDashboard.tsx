@@ -159,8 +159,6 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
   const [verify, setVerify]           = useState<any>(null);
   const [preview, setPreview]         = useState<any>(null);
   const [loading, setLoading]         = useState(false);
-  const [pdfParsing, setPdfParsing]   = useState(false);
-  const [settlImg, setSettlImg]       = useState<string|null>(null);
   const [toast, setToast]             = useState<{ msg: string; ok: boolean } | null>(null);
   const [confirmDlg, setConfirmDlg]   = useState<{ msg: string; onOk: () => void } | null>(null);
   const [tradePage, setTradePage]     = useState(0);
@@ -179,14 +177,10 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
   const [readme, setReadme] = useState<string>("");
   const dailyUploadRef = useRef<HTMLInputElement>(null);
   const [fetchingDaily, setFetchingDaily] = useState(false);
-  const settlPdfRef = useRef<HTMLInputElement>(null);
-  const settlImgRef = useRef<HTMLInputElement>(null);
   const [fetchingSettl, setFetchingSettl] = useState(false);
   const [selectedSettlPeriod, setSelectedSettlPeriod] = useState<string | null>(null);
   const [settling, setSettling] = useState(false);
-  const [settlementMatchStatus, setSettlementMatchStatus] = useState<{ match: boolean; differences: string[] } | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
-  const pdfRef  = useRef<HTMLInputElement>(null);
 
   // Dynamic month list: 2025-11 → today + 8 months
   const MONTHS = (() => {
@@ -450,99 +444,6 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
     setLoading(false);
   };
 
-  // ── Settlement screenshot preview & OCR ────────────────────────
-  const handleImgUpload = async (e: React.ChangeEvent<HTMLInputElement> | any) => {
-    let file = e.target?.files?.[0];
-    if (!file) return;
-
-    const url = URL.createObjectURL(file);
-    setSettlImg(url);
-    showToast("✓ 截图已上传，正在识别...");
-
-    const reader = new FileReader();
-    reader.onload = async () => {
-      try {
-        // 转换为 Base64 发送给 OCR 服务
-        const base64Data = reader.result;
-
-        const response = await fetch("http://localhost:18765/ocr", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ image: base64Data }),
-        });
-
-        if (!response.ok) throw new Error(`OCR 服务错误: ${response.status}`);
-
-        const result = await response.json();
-        console.log("OCR 识别结果:", result);
-
-        if (result.success && result.data) {
-          const data = result.data;
-          setSForm((p: any) => {
-            const updated = { ...p };
-            for (const [key, value] of Object.entries(data)) {
-              if (value !== null) updated[key] = value;
-            }
-            return updated;
-          });
-          const fieldCount = Object.values(data).filter(v => v !== null).length;
-          showToast(`✓ 识别成功，共识别 ${fieldCount} 个字段`);
-        } else {
-          showToast("⚠ 未能识别表格数据: " + (result.error || "未知错误"), false);
-        }
-      } catch (err: any) {
-        console.error("识别错误:", err);
-        showToast("识别失败: " + err.message, false);
-      }
-    };
-    reader.readAsDataURL(file);
-  };
-
-  // ── Settlement PDF ────────────────────────────────────────
-  const handlePdfUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]; if (!file) return;
-    setPdfParsing(true);
-    try {
-      const parsed = await parsePdf(file);
-      const differences: string[] = [];
-
-      // 比对关键字段
-      const fieldsToCompare: [string, string][] = [
-        ["equity_aud", "AUD Equity"],
-        ["cut_aud", "AUD Cut 15%"],
-        ["net_aud", "AUD Net 85%"],
-        ["exe_aud", "AUD Transaction Fees"],
-        ["equity_hkd", "HKD Equity"],
-        ["cut_hkd", "HKD Cut 15%"],
-        ["net_hkd", "HKD Net 85%"],
-        ["exe_hkd", "HKD Transaction Fees"],
-        ["post_exchange_usd", "Post Exchange USD"],
-      ];
-
-      for (const [field, label] of fieldsToCompare) {
-        const currentVal = parseFloat(sForm[field] || "0");
-        const pdfVal = parseFloat(parsed[field] || "0");
-        if (Math.abs(currentVal - pdfVal) > 0.01) {
-          differences.push(`${label}: 截图=${currentVal} vs PDF=${pdfVal}`);
-        }
-      }
-
-      const isMatch = differences.length === 0;
-      setSettlementMatchStatus({ match: isMatch, differences });
-
-      // 只在有差异时提示
-      if (!isMatch) {
-        showToast(`PDF 核对发现差异（${differences.length} 项）`, false);
-      } else {
-        showToast("✓ PDF 数据与截图识别数据完全匹配");
-      }
-
-      setSettlView("edit");
-    } catch (err: any) { showToast("PDF 解析失败: " + err.message, false); }
-    setPdfParsing(false);
-    if (pdfRef.current) pdfRef.current.value = "";
-    if (settlPdfRef.current) settlPdfRef.current.value = "";
-  };
 
   // ── Trigger settlement PDF fetch via local server ─────────
   const triggerSettlFetch = async () => {
@@ -1642,7 +1543,6 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                     <select value={period} onChange={e => setPeriod(e.target.value)} style={{ ...inp, width:110, padding:"5px 10px", fontSize:13 }}>
                       {MONTHS.map(p => <option key={p}>{p}</option>)}
                     </select>
-                    <input type="file" accept=".pdf" ref={settlPdfRef} onChange={handlePdfUpload} style={{ display:"none" }} />
                     <button onClick={triggerSettlFetch} style={{...ghostBtn(), fontSize:12, padding:"5px 9px"}} disabled={fetchingSettl}>
                       {fetchingSettl ? "抓取…" : "↓ 抓取"}
                     </button>
@@ -1910,45 +1810,6 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                 </div>
               );
             })()}
-            <div style={{...card, borderColor:`${C.blue}40`}}>
-              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom: settlImg || settlementMatchStatus ? 16 : 0 }}>
-                <div>
-                  <div style={{ fontSize:15, fontWeight:700, marginBottom:4 }}>上传截图参考 / PDF 核对</div>
-                  <div style={{ fontSize:13, color:C.muted }}>截图上传后在下方显示，对照填写。PDF 上传后自动对比验证数据一致性。</div>
-                </div>
-                <div style={{ display:"flex", gap:10, alignItems:"center" }}>
-                  {pdfParsing&&<span style={{fontSize:13,color:C.blue}}>解析中…</span>}
-                  {settlementMatchStatus && (
-                    <span style={{ fontSize:12, padding:"4px 12px", borderRadius:6, background: settlementMatchStatus.match ? `${C.green}22` : `${C.red}22`, color: settlementMatchStatus.match ? C.green : C.red, fontWeight:700 }}>
-                      {settlementMatchStatus.match ? "✓ 数据匹配" : `✗ 发现 ${settlementMatchStatus.differences.length} 项差异`}
-                    </span>
-                  )}
-                  <input type="file" accept=".pdf" onChange={handlePdfUpload} style={{display:"none"}} id="pdf-upload-input" />
-                  <input type="file" accept="image/*" onChange={(e) => { if(e.target.files?.[0]) { console.log("图片上传"); handleImgUpload(e as any); }}} style={{display:"none"}} id="img-upload-input" />
-                  <button onClick={() => { console.log("点击上传截图"); (document.getElementById("img-upload-input") as HTMLInputElement)?.click(); }} style={ghostBtn()}>🖼 上传截图</button>
-                  <button onClick={()=>(document.getElementById("pdf-upload-input") as HTMLInputElement)?.click()} style={filledBtn(C.blue)} disabled={pdfParsing}>📄 上传 PDF</button>
-                  <button onClick={()=>{ setSForm({...emptySForm, period}); setSettlImg(null); setSettlementMatchStatus(null); }} style={ghostBtn()}>清空</button>
-                </div>
-              </div>
-              {settlImg && (
-                <div style={{ position:"relative", marginBottom:16 }}>
-                  <img src={settlImg} alt="settlement screenshot"
-                    style={{ width:"100%", borderRadius:8, border:`1px solid ${C.border}`, maxHeight:500, objectFit:"contain", background:"#000" }} />
-                  <button onClick={()=>setSettlImg(null)}
-                    style={{ position:"absolute", top:8, right:8, background:"rgba(0,0,0,0.6)", border:"none", color:"#fff", borderRadius:20, padding:"4px 10px", cursor:"pointer", fontSize:12 }}>
-                    × 关闭
-                  </button>
-                </div>
-              )}
-              {settlementMatchStatus && settlementMatchStatus.differences.length > 0 && (
-                <div style={{ ...card, padding:"12px 16px", marginBottom:16, background:`${C.red}08`, border:`1px solid ${C.red}40` }}>
-                  <div style={{ fontSize:13, fontWeight:600, color:C.red, marginBottom:8 }}>PDF 核对差异：</div>
-                  {settlementMatchStatus.differences.map((diff, i) => (
-                    <div key={i} style={{ fontSize:12, color:C.muted, marginBottom:4 }}>• {diff}</div>
-                  ))}
-                </div>
-              )}
-            </div>
             <div style={card}>
               <div style={secHead}>AUD</div>
               <div style={{...grid("1fr 1fr 1fr 1fr"), marginBottom:22}}>
