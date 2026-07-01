@@ -697,7 +697,78 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
         })));
       }
 
-      showToast("Settlement 已保存" + (saveAud || saveHkd ? "，汇率已同步" : ""));
+      // ── 自动算提成 + 计提入保证金 ──
+      // 用「业绩查询→锁定」汇总的月度业绩(trade_records) + 汇率2，算出提成，
+      // 写入 commission_results(confirmed)，并把计提 monthly_usd 计入保证金(margin_ledger)。
+      // 幂等：先删本月计提再按最新结果重写，PDF 对比前后改数据都安全。
+      const { data: mTrades } = await supabase.from("trade_records").select("*").eq("period", linkPeriod);
+      let commissionDone = false;
+      if (mTrades?.length) {
+        const { data: pf } = await supabase.from("period_fees").select("*").eq("period", linkPeriod).maybeSingle();
+        const sortedPf = [...periodFeesAll].sort((a: any, b: any) => b.period.localeCompare(a.period));
+        const pickFx = (key: string) => {
+          const cur = parseFloat(pf?.[key] || 0);
+          if (cur > 0) return cur;
+          const hist = sortedPf.find((p: any) => p.period <= linkPeriod && parseFloat(p[key] || 0) > 0);
+          return hist ? parseFloat(hist[key]) : 0;
+        };
+        const fxAud = pickFx("fx_aud_usd");
+        const fxHkd = pickFx("fx_hkd_usd");
+        const asxAud = parseFloat(pf?.asx_aud ?? 264.44);
+        const chixaUsd = parseFloat(pf?.chixa_usd ?? 129);
+        const hkeHkd = parseFloat(pf?.hke_hkd ?? 451.70);
+        const { data: tradersData } = await supabase.from("traders").select("*");
+        const tmap: Record<string, any> = Object.fromEntries((tradersData || []).map((t: any) => [t.id, t]));
+        const r4 = (n: number) => Math.round(n * 10000) / 10000;
+        const results: any[] = [];
+        for (const t of mTrades) {
+          const cfg = tmap[t.trader_id]; if (!cfg) continue;
+          const net = (parseFloat(t.gross) || 0) - (parseFloat(t.gateway_charge) || 0);
+          const base = net * parseFloat(cfg.rate);
+          const exe = parseFloat(t.exe_fee) || 0;
+          let datafee: number, settle: number, fxRate: number;
+          if (cfg.ccy === "AUD") {
+            if (!fxAud) continue;
+            datafee = asxAud / 2 + (chixaUsd / 2) / fxAud;
+            settle = base - exe - datafee;
+            fxRate = fxAud;
+          } else {
+            if (!fxHkd) continue;
+            datafee = hkeHkd;
+            settle = base - exe - datafee;
+            fxRate = fxHkd;
+          }
+          const usdAmount = settle * fxRate;
+          const platfee = parseFloat(cfg.platfee_usd || 0);
+          results.push({
+            trader_id: t.trader_id, period: linkPeriod,
+            net_native: r4(net), base_native: r4(base), datafee_native: r4(datafee),
+            settle_native: r4(settle), fx_rate: fxRate, usd_amount: r4(usdAmount),
+            platfee_usd: platfee, monthly_usd: r4(usdAmount + platfee),
+            status: "confirmed", confirmed_at: new Date().toISOString(),
+          });
+        }
+        if (results.length) {
+          await supabase.from("commission_results").upsert(results, { onConflict: "trader_id,period" });
+          await supabase.from("margin_ledger").delete().eq("period", linkPeriod).eq("type", "commission");
+          const [yy, mm] = linkPeriod.split("-").map(Number);
+          const commDate = `${linkPeriod}-${String(new Date(yy, mm, 0).getDate()).padStart(2, "0")}`;
+          for (const r of results) {
+            const { data: led } = await supabase.from("margin_ledger").select("amount_usd").eq("trader_id", r.trader_id);
+            const prev = (led || []).reduce((s: number, x: any) => s + parseFloat(x.amount_usd || 0), 0);
+            await supabase.from("margin_ledger").insert({
+              trader_id: r.trader_id, period: linkPeriod, entry_date: commDate,
+              type: "commission", amount_usd: r.monthly_usd, fx_rate: r.fx_rate,
+              balance_after: r4(prev + r.monthly_usd), note: `计提 ${linkPeriod}`,
+            });
+          }
+          commissionDone = true;
+        }
+      }
+
+      showToast("Settlement 已保存"
+        + (saveAud || saveHkd ? "，汇率已同步" : "")
+        + (commissionDone ? "，提成已计提入保证金" : (mTrades?.length ? "" : "（未找到月度业绩，请先在业绩查询锁定该月）")));
       reload(); setSettlView("list");
     } catch (e: any) { showToast(e.message, false); }
     setLoading(false);
