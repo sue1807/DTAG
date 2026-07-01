@@ -121,19 +121,56 @@ def ocr_settlement_image(image_data):
             result_data["net_aud"] = parse_num(match.group(1))
             result_data["net_hkd"] = parse_num(match.group(2))
 
-        # ===== 2. ADJUSTMENT 部分 (可选，AUD, HKD, USD) =====
-        # 查找 "Adjustment" 和 "Expenses" 之间的 SUB TOTAL（容许拼写错误如 "Adjustnents"）
-        adjustment_section = re.search(r"Adjustn?e?nts?[\s\S]*?(?=Expenses)", text, re.IGNORECASE)
-        if adjustment_section:
-            adj_text = adjustment_section.group(0)
-            # 提取最后一个 SUB TOTAL 之后的数字（可能是1个、2个或3个）
-            subtotal_match = re.search(r"SUB\s+TOTAL\n([\d,]+\.?\d*)(?:\n([\d,]+\.?\d*))?(?:\n([\d,]+\.?\d*))?", adj_text, re.IGNORECASE)
-            if subtotal_match:
-                result_data["adjustment_sub_total_aud"] = parse_num(subtotal_match.group(1))
-                if subtotal_match.group(2):
-                    result_data["adjustment_sub_total_hkd"] = parse_num(subtotal_match.group(2))
-                if subtotal_match.group(3):
-                    result_data["adjustment_sub_total_usd"] = parse_num(subtotal_match.group(3))
+        # ===== 2. ADJUSTMENT 部分 (AUD/HKD/USD，用坐标判断币种列) =====
+        # Adjustments SUB TOTAL 的数值每月可能落在不同币种列（如 4月在 USD、5月在 AUD），
+        # 所以不能假设第一个数字=AUD；改用每个文本块的横向坐标与 AUD/HKD/USD 表头对齐判断列。
+        def _cx(bbox):
+            xs = [float(p[0]) for p in bbox]
+            return sum(xs) / len(xs)
+
+        def _cy(bbox):
+            ys = [float(p[1]) for p in bbox]
+            return sum(ys) / len(ys)
+
+        # 表头列锚点：取首次出现的 AUD/HKD/USD 的 x 中心
+        col_x = {}
+        for bbox, txt, _conf in result:
+            t = txt.strip().upper()
+            if t in ("AUD", "HKD", "USD") and t not in col_x:
+                col_x[t] = _cx(bbox)
+
+        # 定位 Adjustments 区块的 y 范围（Adjustments 标题 → Expenses 标题之间）
+        adj_y = exp_y = None
+        for bbox, txt, _conf in result:
+            t = txt.strip().lower()
+            if adj_y is None and t.startswith("adjust"):
+                adj_y = _cy(bbox)
+            if exp_y is None and t.startswith("expense"):
+                exp_y = _cy(bbox)
+
+        # 在该区块内找 SUB TOTAL 行的 y（记录文字高度用于自适应容差）
+        sub_y, sub_h = None, 0.0
+        if adj_y is not None:
+            for bbox, txt, _conf in result:
+                t = txt.strip().upper().replace(" ", "")
+                y = _cy(bbox)
+                if t.startswith("SUBTOTAL") and y > adj_y and (exp_y is None or y < exp_y):
+                    sub_y = y
+                    ys = [float(p[1]) for p in bbox]
+                    sub_h = max(ys) - min(ys)
+                    break
+
+        # 在 SUB TOTAL 同一行找数字，按 x 对齐最近的币种列
+        if sub_y is not None and col_x:
+            tol = max(12.0, sub_h * 0.8)
+            for bbox, txt, _conf in result:
+                val = parse_num(txt.strip())
+                if val is None:
+                    continue
+                if abs(_cy(bbox) - sub_y) <= tol:
+                    col = min(col_x, key=lambda c: abs(col_x[c] - _cx(bbox)))
+                    result_data["adjustment_sub_total_" + col.lower()] = val
+                    log.info(f"Adjustment SUB TOTAL: {val} → {col} 列")
 
         # ===== 3. EXPENSES 部分 - Total Transaction Fees (AUD, HKD, USD) =====
         match = re.search(r"Total\s+Transaction\s+Fees?\n([-\d,]+\.?\d*)\n([-\d,]+\.?\d*)(?:\n([-\d,]+\.?\d*))?", text, re.IGNORECASE)
