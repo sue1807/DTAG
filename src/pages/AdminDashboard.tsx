@@ -482,12 +482,33 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
       }
       if (action === "verify")    { setVerify(r.verification); showToast(r.verification.overall_pass ? "核对通过 ✓" : "有差异，请检查", r.verification.overall_pass); }
       if (action === "confirm") {
-        // Ensure status is set to confirmed in DB regardless of smooth-service behaviour
+        // 1. 状态置为已核对
         const { error } = await supabase.from("commission_results")
           .update({ status: "confirmed", confirmed_at: new Date().toISOString() })
           .eq("period", period);
         if (error) console.warn("confirm update:", error.message);
-        showToast("已确认发布，保证金已更新"); reload();
+
+        // 2. 把计提提成（monthly_usd）写入保证金 margin_ledger（type=commission）
+        //    幂等：同一 trader+period 已有 commission 记录则跳过，避免重复计入。
+        const [yy, mm] = period.split("-").map(Number);
+        const entryDate = `${period}-${String(new Date(yy, mm, 0).getDate()).padStart(2, "0")}`;
+        const { data: confirmedRows } = await supabase.from("commission_results")
+          .select("*").eq("period", period).eq("status", "confirmed");
+        for (const cr of confirmedRows || []) {
+          const { data: existing } = await supabase.from("margin_ledger")
+            .select("id").eq("trader_id", cr.trader_id).eq("period", period).eq("type", "commission").limit(1);
+          if (existing?.length) continue;
+          const { data: led } = await supabase.from("margin_ledger").select("amount_usd").eq("trader_id", cr.trader_id);
+          const prev = (led || []).reduce((s: number, x: any) => s + parseFloat(x.amount_usd || 0), 0);
+          const amt = parseFloat(cr.monthly_usd) || 0;
+          await supabase.from("margin_ledger").insert({
+            trader_id: cr.trader_id, period, entry_date: entryDate,
+            type: "commission", amount_usd: amt, fx_rate: cr.fx_rate,
+            balance_after: Math.round((prev + amt) * 10000) / 10000,
+            note: `计提 ${period}`,
+          });
+        }
+        showToast("已确认发布，计提已计入保证金"); reload();
       }
     } catch (e: any) { showToast(e.message, false); }
     setLoading(false);
@@ -1754,6 +1775,10 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                   const sp = selectedSettlPeriod;
                   const spTrades = tradeRecords.filter((r:any) => r.period === sp);
                   const spComms  = commissions.filter((c:any) => c.period === sp);
+                  // 有月度 CSV 用 CSV；没 CSV 但有已核对结果时，用 commission_results 兜底显示
+                  const displayRows = spTrades.length > 0
+                    ? spTrades
+                    : spComms.map((c:any) => ({ id:`c-${c.trader_id}`, trader_id:c.trader_id, gross:null, gateway_charge:null, exe_fee:null, net_native:c.net_native, _fromComm:true }));
                   const isConfirmedPeriod = spComms.some((c:any) => c.status === "confirmed");
                   const sortedPfSp = [...periodFeesAll].sort((a:any,b:any) => b.period.localeCompare(a.period));
                   const pfSp = sortedPfSp.find((p:any) => p.period <= sp && (parseFloat(p.fx_aud_usd||0)>0));
@@ -1807,9 +1832,9 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                         )}
                       </div>
 
-                      {spTrades.length === 0 ? (
+                      {displayRows.length === 0 ? (
                         <div style={{ ...card, textAlign:"center", color:C.faint, fontSize:13, padding:"40px" }}>
-                          该月暂无已上传 CSV 数据
+                          该月暂无数据
                         </div>
                       ) : (
                         <div style={{ ...card, padding:0, overflow:"hidden" }}>
@@ -1817,9 +1842,9 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                             <div style={{ minWidth:1000, display:"grid", gridTemplateColumns:"90px 70px 90px 110px 110px 100px 160px 100px 120px", padding:"8px 16px", gap:8, fontSize:11, fontWeight:700, color:C.faint, letterSpacing:0.8, background:C.elevated, borderBottom:`1px solid ${C.border}` }}>
                               {["交易员","状态","Gross","Gateway","NET","Exe Fee","Entitlements","Office Fee","业绩提成(预算)"].map(h=><div key={h}>{h}</div>)}
                             </div>
-                            {spTrades.map((r:any, i:number) => {
+                            {displayRows.map((r:any, i:number) => {
                               const cfg = TRADERS[r.trader_id];
-                              const net = (r.gross||0)-(r.gateway_charge||0);
+                              const net = r._fromComm ? (parseFloat(r.net_native)||0) : (r.gross||0)-(r.gateway_charge||0);
                               const comm = spComms.find((c:any) => c.trader_id === r.trader_id);
                               const isConf = comm?.status === "confirmed";
                               const estComm = comm?.monthly_usd != null ? parseFloat(comm.monthly_usd) : null;
@@ -1829,7 +1854,7 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                                 <div key={r.id||i} style={{ minWidth:1000, display:"grid", gridTemplateColumns:"90px 70px 110px 110px 110px 100px 160px 100px 120px", padding:"10px 16px", gap:8, borderBottom:`1px solid ${C.border}`, background:i%2?`${C.elevated}60`:"transparent", fontSize:13, alignItems:"center" }}>
                                   <div style={{ fontWeight:600 }}>{cfg?.name||r.trader_id}</div>
                                   <span style={{ fontSize:10, padding:"2px 6px", borderRadius:8, fontWeight:700, background:isConf?`${C.green}22`:`${C.warn}22`, color:isConf?C.green:C.warn }}>{isConf?"已核对":"待确认"}</span>
-                                  <div style={{ color:(r.gross||0)>=0?C.green:C.red }}>{(r.gross||0).toFixed(2)}</div>
+                                  <div style={{ color:r._fromComm?C.faint:(r.gross||0)>=0?C.green:C.red }}>{r._fromComm ? "—" : (r.gross||0).toFixed(2)}</div>
                                   <div style={{ color:C.red }}>{r.gateway_charge!=null?`-${r.gateway_charge.toFixed(2)}`:"—"}</div>
                                   <div style={{ fontWeight:600, color:net>=0?C.green:C.red }}>{net.toFixed(2)}</div>
                                   <div style={{ color:C.red }}>{r.exe_fee!=null?`-${r.exe_fee.toFixed(2)}`:"—"}</div>
