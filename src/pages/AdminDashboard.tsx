@@ -80,9 +80,13 @@ async function parsePdf(file: File): Promise<any> {
   const arrayBuffer = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
   let fullText = "";
+  let page1Items: { str: string; x: number; y: number }[] = [];
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
+    if (i === 1) {
+      page1Items = content.items.map((it: any) => ({ str: (it.str || "").trim(), x: it.transform[4], y: it.transform[5] }));
+    }
     fullText += content.items.map((item: any) => item.str).join(" ") + "\n";
   }
   const g = (pattern: RegExp) => { const m = fullText.match(pattern); return m ? toNum(m[1]) : null; };
@@ -128,7 +132,46 @@ async function parsePdf(file: File): Promise<any> {
     let m; while ((m = wdRegex.exec(wdSection[1])) !== null)
       erp_withdrawals.push({ ccy: m[1], amount: toNum(m[2]), date: m[3] });
   }
-  return { equity_aud, cut_aud, net_aud, exe_aud, equity_hkd, cut_hkd, net_hkd, exe_hkd, post_exchange_aud, post_exchange_hkd, post_exchange_usd, wire_fees_usd, loss_coverage, payment_exchange, erp_deposits, erp_withdrawals };
+  // Adjustments SUB TOTAL —— 用坐标判断币种列（列每月可能不同，如 4月USD、5月AUD）
+  let adjustment_sub_total_aud: number | null = null;
+  let adjustment_sub_total_hkd: number | null = null;
+  let adjustment_sub_total_usd: number | null = null;
+  (() => {
+    // 表头列锚点：首次出现的 AUD/HKD/USD 的 x
+    const colX: Record<string, number> = {};
+    for (const it of page1Items) {
+      const t = it.str.toUpperCase();
+      if ((t === "AUD" || t === "HKD" || t === "USD") && !(t in colX)) colX[t] = it.x;
+    }
+    // Adjustments / Expenses 的 y（pdf.js 坐标 y 向上：往下 y 变小 → expY < subY < adjY）
+    let adjY: number | null = null, expY: number | null = null;
+    for (const it of page1Items) {
+      const t = it.str.toLowerCase();
+      if (adjY === null && t.startsWith("adjust")) adjY = it.y;
+      if (expY === null && t.startsWith("expense")) expY = it.y;
+    }
+    if (adjY === null || Object.keys(colX).length === 0) return;
+    // 在 Adjustments 和 Expenses 之间找 SUB TOTAL 行的 y
+    let subY: number | null = null;
+    for (const it of page1Items) {
+      if (it.str.toUpperCase().startsWith("SUB") && it.y < adjY && (expY === null || it.y > expY)) { subY = it.y; break; }
+    }
+    if (subY === null) return;
+    // 同一行的数字，按 x 对齐最近的币种列
+    for (const it of page1Items) {
+      const raw = it.str.trim();
+      if (!/^-?[\d,]+\.?\d*$/.test(raw)) continue;   // 只处理纯数字文本
+      if (Math.abs(it.y - subY) > 6) continue;        // 同一行
+      let best = "", bestD = Infinity;
+      for (const c in colX) { const d = Math.abs(colX[c] - it.x); if (d < bestD) { bestD = d; best = c; } }
+      const val = toNum(raw);
+      if (best === "AUD") adjustment_sub_total_aud = val;
+      else if (best === "HKD") adjustment_sub_total_hkd = val;
+      else if (best === "USD") adjustment_sub_total_usd = val;
+    }
+  })();
+
+  return { equity_aud, cut_aud, net_aud, exe_aud, equity_hkd, cut_hkd, net_hkd, exe_hkd, adjustment_sub_total_aud, adjustment_sub_total_hkd, adjustment_sub_total_usd, post_exchange_aud, post_exchange_hkd, post_exchange_usd, wire_fees_usd, loss_coverage, payment_exchange, erp_deposits, erp_withdrawals };
 }
 
 // ── Email Notifications Component ────────────────────────────
@@ -509,6 +552,9 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
         ["cut_hkd", "HKD Cut 15%"],
         ["net_hkd", "HKD Net 85%"],
         ["exe_hkd", "HKD Transaction Fees"],
+        ["adjustment_sub_total_aud", "Adjustments AUD"],
+        ["adjustment_sub_total_hkd", "Adjustments HKD"],
+        ["adjustment_sub_total_usd", "Adjustments USD"],
         ["post_exchange_usd", "Post Exchange USD"],
       ];
       for (const [field, label] of fieldsToCompare) {
