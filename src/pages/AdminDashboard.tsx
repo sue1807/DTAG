@@ -648,7 +648,31 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
         if (saveAud) setFForm((f: any) => ({ ...f, fx_aud_usd: saveAud.toFixed(8) }));
         if (saveHkd) setFForm((f: any) => ({ ...f, fx_hkd_usd: saveHkd.toFixed(8) }));
       }
-      showToast("Settlement 已保存" + (saveAud || saveHkd ? "，汇率已同步" : "")); 
+
+      // 联动：把编辑页的 USD 存入同步到主页 ERP 账户（erp_ledger）。
+      // 幂等：先删除本月由此处自动生成的记录，再按当前存入重建，不影响手动添加的记录。
+      const linkPeriod = sForm.period || period;
+      const AUTO_NOTE = "⟳ 来自 Settlement 编辑";
+      await supabase.from("erp_ledger").delete()
+        .eq("settlement_period", linkPeriod).eq("type", "settlement_deposit").eq("note", AUTO_NOTE);
+      const usdDeposits = (sForm.erp_deposits || []).filter(
+        (d: any) => (d.ccy || "USD") === "USD" && Math.abs(parseFloat(d.amount)) > 0
+      );
+      if (usdDeposits.length > 0) {
+        const toISO = (s: string) =>
+          (s && /^\d{2}\/\d{2}\/\d{4}$/.test(s))
+            ? `${s.split("/")[2]}-${s.split("/")[0]}-${s.split("/")[1]}`
+            : `${linkPeriod}-01`;
+        await supabase.from("erp_ledger").insert(usdDeposits.map((d: any) => ({
+          entry_date: toISO(d.date),
+          type: "settlement_deposit",
+          amount_usd: Math.abs(parseFloat(d.amount)),
+          settlement_period: linkPeriod,
+          note: AUTO_NOTE,
+        })));
+      }
+
+      showToast("Settlement 已保存" + (saveAud || saveHkd ? "，汇率已同步" : ""));
       reload(); setSettlView("list");
     } catch (e: any) { showToast(e.message, false); }
     setLoading(false);
@@ -2026,19 +2050,27 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                 <button onClick={()=>setSForm((p:any)=>({...p,loss_coverage:[...p.loss_coverage,{from_ccy:"AUD",from_amount:"",to_ccy:"USD",to_amount:"",rate:""}]}))} style={ghostBtn()}>+ 添加</button>
               </div>
               {sForm.loss_coverage.length===0&&<div style={{fontSize:13,color:C.faint}}>本月无</div>}
-              {sForm.loss_coverage.map((row:any,i:number)=>(
+              {sForm.loss_coverage.map((row:any,i:number)=>{
+                // Loss Coverage 汇率 = 从 ÷ 到（覆盖币 ÷ 被覆盖币，取绝对值），与 PDF rate 列一致
+                const syncLcRate = (a:any[], idx:number) => {
+                  const f = Math.abs(parseFloat(a[idx].from_amount));
+                  const t = Math.abs(parseFloat(a[idx].to_amount));
+                  if (f > 0 && t > 0) a[idx].rate = (f / t).toFixed(6);
+                };
+                return (
                 <div key={i} style={{...grid("80px 1fr 24px 80px 1fr 1fr 30px"),alignItems:"end",marginBottom:10}}>
                   {[
                     {l:"从",el:<select style={inp} value={row.from_ccy} onChange={e=>{const a=[...sForm.loss_coverage];a[i]={...a[i],from_ccy:e.target.value};setSForm((p:any)=>({...p,loss_coverage:a}))}}><option>AUD</option><option>HKD</option><option>USD</option></select>},
-                    {l:"金额",el:<input type="number" style={inp} value={row.from_amount} onChange={e=>{const a=[...sForm.loss_coverage];a[i]={...a[i],from_amount:e.target.value};setSForm((p:any)=>({...p,loss_coverage:a}))}} />},
+                    {l:"金额",el:<input type="number" style={inp} value={row.from_amount} onChange={e=>{const a=[...sForm.loss_coverage];a[i]={...a[i],from_amount:e.target.value};syncLcRate(a,i);setSForm((p:any)=>({...p,loss_coverage:a}))}} />},
                     {l:"",el:<div style={{textAlign:"center",paddingBottom:10,color:C.muted}}>→</div>},
                     {l:"到",el:<select style={inp} value={row.to_ccy} onChange={e=>{const a=[...sForm.loss_coverage];a[i]={...a[i],to_ccy:e.target.value};setSForm((p:any)=>({...p,loss_coverage:a}))}}><option>USD</option><option>HKD</option><option>AUD</option></select>},
-                    {l:"金额",el:<input type="number" style={inp} value={row.to_amount} onChange={e=>{const a=[...sForm.loss_coverage];a[i]={...a[i],to_amount:e.target.value};setSForm((p:any)=>({...p,loss_coverage:a}))}} />},
-                    {l:"汇率",el:<input type="number" step="0.000001" style={inp} value={row.rate} onChange={e=>{const a=[...sForm.loss_coverage];a[i]={...a[i],rate:e.target.value};setSForm((p:any)=>({...p,loss_coverage:a}))}} />},
+                    {l:"金额",el:<input type="number" style={inp} value={row.to_amount} onChange={e=>{const a=[...sForm.loss_coverage];a[i]={...a[i],to_amount:e.target.value};syncLcRate(a,i);setSForm((p:any)=>({...p,loss_coverage:a}))}} />},
+                    {l:"汇率（自动）",el:<input type="number" step="0.000001" style={{...inp,borderColor:C.blue+"60"}} value={row.rate} onChange={e=>{const a=[...sForm.loss_coverage];a[i]={...a[i],rate:e.target.value};setSForm((p:any)=>({...p,loss_coverage:a}))}} />},
                     {l:"",el:<button onClick={()=>{const a=sForm.loss_coverage.filter((_:any,j:number)=>j!==i);setSForm((p:any)=>({...p,loss_coverage:a}))}} style={{...ghostBtn(),padding:"8px"}}>×</button>},
                   ].map(({l,el},j)=><div key={j}>{l&&<label style={lbl}>{l}</label>}{el}</div>)}
                 </div>
-              ))}
+                );
+              })}
             </div>
             {/* Payment Exchange */}
             <div style={card}>
