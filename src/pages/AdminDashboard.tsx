@@ -659,10 +659,14 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
         (d: any) => (d.ccy || "USD") === "USD" && Math.abs(parseFloat(d.amount)) > 0
       );
       if (usdDeposits.length > 0) {
-        const toISO = (s: string) =>
-          (s && /^\d{2}\/\d{2}\/\d{4}$/.test(s))
-            ? `${s.split("/")[2]}-${s.split("/")[0]}-${s.split("/")[1]}`
-            : `${linkPeriod}-01`;
+        const toISO = (s: string) => {
+          const v = (s || "").trim();
+          let m = v.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);   // YYYY-MM-DD / YYYY/M/D
+          if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+          m = v.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);       // MM/DD/YYYY / M/D/YYYY
+          if (m) return `${m[3]}-${m[1].padStart(2, "0")}-${m[2].padStart(2, "0")}`;
+          return `${linkPeriod}-01`;
+        };
         await supabase.from("erp_ledger").insert(usdDeposits.map((d: any) => ({
           entry_date: toISO(d.date),
           type: "settlement_deposit",
