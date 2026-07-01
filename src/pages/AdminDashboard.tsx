@@ -1897,6 +1897,42 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                 </div>
               );
             })()}
+            {/* 上传截图 / PDF —— OCR 识别 & PDF 核对入口 */}
+            <div style={{...card, borderColor:`${C.blue}40`}}>
+              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap" as const, gap:10 }}>
+                <div>
+                  <div style={{ fontSize:15, fontWeight:700, marginBottom:4 }}>上传截图 / PDF 自动识别</div>
+                  <div style={{ fontSize:13, color:C.muted }}>上传 Settlement 截图用 OCR 识别自动填入，或上传 PDF 核对数据一致性。</div>
+                </div>
+                <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+                  {pdfParsing && <span style={{fontSize:13,color:C.blue}}>解析中…</span>}
+                  {settlementMatchStatus && (
+                    <span style={{ fontSize:12, padding:"4px 12px", borderRadius:6, background: settlementMatchStatus.match ? `${C.green}22` : `${C.red}22`, color: settlementMatchStatus.match ? C.green : C.red, fontWeight:700 }}>
+                      {settlementMatchStatus.match ? "✓ 数据匹配" : `✗ ${settlementMatchStatus.differences.length} 项差异`}
+                    </span>
+                  )}
+                  <input type="file" accept="image/*" onChange={(e)=>{ if(e.target.files?.[0]) handleImgUpload(e as any); }} style={{display:"none"}} id="img-upload-input" />
+                  <input type="file" accept=".pdf" onChange={handlePdfUpload} style={{display:"none"}} id="pdf-upload-input" />
+                  <button onClick={()=>(document.getElementById("img-upload-input") as HTMLInputElement)?.click()} style={ghostBtn()}>🖼 上传截图</button>
+                  <button onClick={()=>(document.getElementById("pdf-upload-input") as HTMLInputElement)?.click()} style={filledBtn(C.blue)} disabled={pdfParsing}>📄 上传 PDF</button>
+                  <button onClick={()=>{ setSForm({...emptySForm, period}); setSettlImg(null); setSettlementMatchStatus(null); }} style={ghostBtn()}>清空</button>
+                </div>
+              </div>
+              {settlImg && (
+                <div style={{ position:"relative", marginTop:16 }}>
+                  <img src={settlImg} alt="settlement" style={{ width:"100%", borderRadius:8, border:`1px solid ${C.border}`, maxHeight:500, objectFit:"contain", background:"#000" }} />
+                  <button onClick={()=>setSettlImg(null)} style={{ position:"absolute", top:8, right:8, background:"rgba(0,0,0,0.6)", border:"none", color:"#fff", borderRadius:20, padding:"4px 10px", cursor:"pointer", fontSize:12 }}>× 关闭</button>
+                </div>
+              )}
+              {settlementMatchStatus && settlementMatchStatus.differences.length > 0 && (
+                <div style={{ ...card, padding:"12px 16px", marginTop:16, background:`${C.red}08`, border:`1px solid ${C.red}40` }}>
+                  <div style={{ fontSize:13, fontWeight:600, color:C.red, marginBottom:8 }}>PDF 核对差异：</div>
+                  {settlementMatchStatus.differences.map((diff, i) => (
+                    <div key={i} style={{ fontSize:12, color:C.muted, marginBottom:4 }}>• {diff}</div>
+                  ))}
+                </div>
+              )}
+            </div>
             <div style={card}>
               <div style={secHead}>AUD</div>
               <div style={{...grid("1fr 1fr 1fr 1fr"), marginBottom:22}}>
@@ -1912,9 +1948,9 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                     <input type="number" step="0.01" style={inp} value={sForm[k as string]} onChange={e=>setSForm((p:any)=>({...p,[k as string]:e.target.value}))} /></div>
                 ))}
               </div>
-              <div style={secHead}>调整项</div>
+              <div style={secHead}>Adjustments Sub Total（调整合计）</div>
               <div style={{...grid("1fr 1fr 1fr"), marginBottom:22}}>
-                {[["AUD 调整","adjustment_sub_total_aud"],["HKD 调整","adjustment_sub_total_hkd"],["USD 调整","adjustment_sub_total_usd"]].map(([l,k])=>(
+                {[["AUD","adjustment_sub_total_aud"],["HKD","adjustment_sub_total_hkd"],["USD","adjustment_sub_total_usd"]].map(([l,k])=>(
                   <div key={k as string}><label style={lbl}>{l}</label>
                     <input type="number" step="0.01" style={inp} value={sForm[k as string]} onChange={e=>setSForm((p:any)=>({...p,[k as string]:e.target.value}))} /></div>
                 ))}
