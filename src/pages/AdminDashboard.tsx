@@ -202,7 +202,7 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
 
   // Forms
   const [mForm, setMForm] = useState({ trader_id: "HONG045", type: "deposit", amount_usd: "", entry_date: new Date().toISOString().slice(0,10), note: "" });
-  const emptySForm = { period, equity_aud:"", cut_aud:"", net_aud:"", exe_aud:"", equity_hkd:"", cut_hkd:"", net_hkd:"", exe_hkd:"", post_exchange_aud:"", post_exchange_hkd:"", post_exchange_usd:"", wire_fees_usd:"", fx_notes:"", loss_coverage:[] as any[], payment_exchange:[] as any[], erp_deposits:[] as any[], erp_withdrawals:[] as any[] };
+  const emptySForm = { period, equity_aud:"", cut_aud:"", net_aud:"", exe_aud:"", equity_hkd:"", cut_hkd:"", net_hkd:"", exe_hkd:"", adjustment_sub_total_aud:"", adjustment_sub_total_hkd:"", adjustment_sub_total_usd:"", post_exchange_aud:"", post_exchange_hkd:"", post_exchange_usd:"", wire_fees_usd:"", fx_notes:"", loss_coverage:[] as any[], payment_exchange:[] as any[], erp_deposits:[] as any[], erp_withdrawals:[] as any[] };
   const [sForm, setSForm] = useState<any>(emptySForm);
   const [fForm, setFForm] = useState<any>({ period:"2026-02", asx_aud:"264.44", chixa_usd:"129.00", hke_hkd:"451.70", office_usd:"150.00", wire_usd:"", fx_aud_usd:"", fx_hkd_usd:"" });
   // "pdf"=当期PDF, "derived"=由loss coverage推算, "prev"=沿用上期, ""=手动/未知
@@ -459,38 +459,43 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
     setSettlImg(url);
     showToast("✓ 截图已上传，正在识别...");
 
-    try {
-      // 直接调用后端 OCR API
-      const formData = new FormData();
-      formData.append("file", file);
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        // 转换为 Base64 发送给 OCR 服务
+        const base64Data = reader.result;
 
-      const response = await fetch("http://localhost:18765/ocr", {
-        method: "POST",
-        body: formData,
-      });
+        const response = await fetch("http://localhost:18765/ocr", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ image: base64Data }),
+        });
 
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        if (!response.ok) throw new Error(`OCR 服务错误: ${response.status}`);
 
-      const result = await response.json();
-      console.log("OCR 识别结果:", result);
+        const result = await response.json();
+        console.log("OCR 识别结果:", result);
 
-      if (result.success && result.data) {
-        const data = result.data;
-        setSForm((p: any) => ({
-          ...p,
-          equity_aud: data.equity_aud ?? p.equity_aud,
-          cut_aud: data.cut_aud ?? p.cut_aud,
-          net_aud: data.net_aud ?? p.net_aud,
-          exe_aud: data.exe_aud ?? p.exe_aud,
-        }));
-        showToast("✓ 截图识别完成，已自动填入数据");
-      } else {
-        showToast("⚠ 未能识别表格数据: " + (result.error || "未知错误"), false);
+        if (result.success && result.data) {
+          const data = result.data;
+          setSForm((p: any) => {
+            const updated = { ...p };
+            for (const [key, value] of Object.entries(data)) {
+              if (value !== null) updated[key] = value;
+            }
+            return updated;
+          });
+          const fieldCount = Object.values(data).filter(v => v !== null).length;
+          showToast(`✓ 识别成功，共识别 ${fieldCount} 个字段`);
+        } else {
+          showToast("⚠ 未能识别表格数据: " + (result.error || "未知错误"), false);
+        }
+      } catch (err: any) {
+        console.error("识别错误:", err);
+        showToast("识别失败: " + err.message, false);
       }
-    } catch (err: any) {
-      console.error("识别错误:", err);
-      showToast("识别失败: " + err.message, false);
-    }
+    };
+    reader.readAsDataURL(file);
   };
 
   // ── Settlement PDF ────────────────────────────────────────
@@ -589,7 +594,7 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
   const saveSettlement = async () => {
     setLoading(true);
     try {
-      const numFields = ["equity_aud","cut_aud","net_aud","exe_aud","equity_hkd","cut_hkd","net_hkd","exe_hkd","post_exchange_aud","post_exchange_hkd","post_exchange_usd","wire_fees_usd"];
+      const numFields = ["equity_aud","cut_aud","net_aud","exe_aud","equity_hkd","cut_hkd","net_hkd","exe_hkd","adjustment_sub_total_aud","adjustment_sub_total_hkd","adjustment_sub_total_usd","post_exchange_aud","post_exchange_hkd","post_exchange_usd","wire_fees_usd"];
       const payload: any = { period: sForm.period || period };
       for (const k of numFields) payload[k] = sForm[k] !== "" ? parseFloat(sForm[k]) : null;
       payload.fx_notes = sForm.fx_notes || null;
@@ -1638,29 +1643,6 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                       {MONTHS.map(p => <option key={p}>{p}</option>)}
                     </select>
                     <input type="file" accept=".pdf" ref={settlPdfRef} onChange={handlePdfUpload} style={{ display:"none" }} />
-                    <button onClick={() => { setSForm({...emptySForm, period}); settlPdfRef.current?.click(); }} style={{...ghostBtn(), fontSize:12, padding:"5px 9px"}} disabled={pdfParsing}>
-                      {pdfParsing ? "解析…" : "↑ PDF"}
-                    </button>
-                    <button onClick={async () => {
-                      const input = document.createElement("input");
-                      input.type = "file";
-                      input.accept = "image/*";
-
-                      await new Promise<void>((resolve) => {
-                        input.addEventListener("change", (e: any) => {
-                          const file = input.files?.[0];
-                          if (file) {
-                            setSForm({...emptySForm, period});
-                            setSettlView("edit");
-                            handleImgUpload(e as any);
-                          }
-                          resolve();
-                        }, { once: true });
-                        input.click();
-                      });
-                    }} style={{...ghostBtn(), fontSize:12, padding:"5px 9px"}}>
-                      🖼 截图
-                    </button>
                     <button onClick={triggerSettlFetch} style={{...ghostBtn(), fontSize:12, padding:"5px 9px"}} disabled={fetchingSettl}>
                       {fetchingSettl ? "抓取…" : "↓ 抓取"}
                     </button>
@@ -1978,6 +1960,13 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
               <div style={secHead}>HKD</div>
               <div style={{...grid("1fr 1fr 1fr 1fr"), marginBottom:22}}>
                 {[["Equity","equity_hkd"],["Cut 15%","cut_hkd"],["Net 85%","net_hkd"],["Transaction Fees","exe_hkd"]].map(([l,k])=>(
+                  <div key={k as string}><label style={lbl}>{l}</label>
+                    <input type="number" step="0.01" style={inp} value={sForm[k as string]} onChange={e=>setSForm((p:any)=>({...p,[k as string]:e.target.value}))} /></div>
+                ))}
+              </div>
+              <div style={secHead}>调整项</div>
+              <div style={{...grid("1fr 1fr 1fr"), marginBottom:22}}>
+                {[["AUD 调整","adjustment_sub_total_aud"],["HKD 调整","adjustment_sub_total_hkd"],["USD 调整","adjustment_sub_total_usd"]].map(([l,k])=>(
                   <div key={k as string}><label style={lbl}>{l}</label>
                     <input type="number" step="0.01" style={inp} value={sForm[k as string]} onChange={e=>setSForm((p:any)=>({...p,[k as string]:e.target.value}))} /></div>
                 ))}
