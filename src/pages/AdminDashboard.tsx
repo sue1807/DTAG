@@ -955,12 +955,11 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
   };
 
   const handleMonthlyFetch = async () => {
-    const now = new Date();
-    const year = now.getFullYear();
-    const month = now.getMonth() + 1;
-    const dateFrom = `${year}-${String(month).padStart(2, "0")}-01`;
+    const period = (dailyFilter.dateFrom || new Date().toISOString().slice(0, 10)).slice(0, 7);
+    const [year, month] = period.split("-").map(Number);
+    const dateFrom = `${period}-01`;
     const lastDay = new Date(year, month, 0).getDate();
-    const dateTo = `${year}-${String(month).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
+    const dateTo = `${period}-${String(lastDay).padStart(2, "0")}`;
     setFetchingDaily(true);
     try {
       const res = await fetch(
@@ -983,10 +982,7 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
   };
 
   const handleLockCurrentMonth = async () => {
-    const now = new Date();
-    const year = now.getFullYear();
-    const month = now.getMonth() + 1;
-    const period = `${year}-${String(month).padStart(2, "0")}`;
+    const period = (dailyFilter.dateFrom || new Date().toISOString().slice(0, 10)).slice(0, 7);
     setLoading(true);
     try {
       // 1. 标记该月 daily_performance 为已锁定
@@ -1005,10 +1001,11 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
         const tid = resolveId(row.trader_name);
         if (!(TRADERS as any)[tid]) continue;
         if (!agg[tid]) agg[tid] = { trader_id: tid, period, gross: 0, gateway_charge: 0, exe_fee: 0, sec_fee: 0, ccy: (TRADERS as any)[tid].ccy, source_file: `daily_lock_${period}` };
+        // gross 保留盈亏符号；gateway/exe/sec 是费用，daily 里可能存负数，统一取绝对值存正（trade_records 约定为正，计算时 net = gross - gateway_charge）
         agg[tid].gross += parseFloat(row.gross) || 0;
-        agg[tid].gateway_charge += parseFloat(row.gateway_charge) || 0;
-        agg[tid].exe_fee += parseFloat(row.exe_fee) || 0;
-        agg[tid].sec_fee += parseFloat(row.sec_fee) || 0;
+        agg[tid].gateway_charge += Math.abs(parseFloat(row.gateway_charge) || 0);
+        agg[tid].exe_fee += Math.abs(parseFloat(row.exe_fee) || 0);
+        agg[tid].sec_fee += Math.abs(parseFloat(row.sec_fee) || 0);
       }
       const aggRows = Object.values(agg);
       aggRows.forEach((r: any) => {
@@ -1017,14 +1014,19 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
         r.exe_fee = Math.round(r.exe_fee * 10000) / 10000;
         r.sec_fee = Math.round(r.sec_fee * 10000) / 10000;
       });
-      // 已确认月份不覆盖，保护已锁定的提成基础
-      const { data: locked } = await supabase.from("commission_results")
-        .select("trader_id").eq("period", period).eq("status", "confirmed").limit(1);
-      if (aggRows.length > 0 && !locked?.length) {
+      // 仅当该月已有"真实计提"（monthly_usd 有值）时才保护、不覆盖；
+      // 空壳 confirmed（无计提值）允许覆盖汇总，并重置为草稿以便重新计算。
+      const { data: confirmedComm } = await supabase.from("commission_results")
+        .select("monthly_usd").eq("period", period).eq("status", "confirmed");
+      const hasRealCommission = (confirmedComm || []).some((c: any) => c.monthly_usd != null && parseFloat(c.monthly_usd) !== 0);
+      let summarized = false;
+      if (aggRows.length > 0 && !hasRealCommission) {
         await supabase.from("trade_records").upsert(aggRows, { onConflict: "trader_id,period" });
+        await supabase.from("commission_results").update({ status: "draft" }).eq("period", period).eq("status", "confirmed");
+        summarized = true;
       }
 
-      showToast(`✓ ${period} 数据已锁定${aggRows.length && !locked?.length ? `并汇总（${aggRows.length} 位交易员）` : ""}`);
+      showToast(`✓ ${period} 数据已锁定${summarized ? `并汇总 ${aggRows.length} 位交易员，请去「提成计算」` : ""}`);
       loadDailyData(dailyFilter.dateFrom, dailyFilter.dateTo);
       reload();
     } catch (e: any) {
