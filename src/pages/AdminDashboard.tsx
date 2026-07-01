@@ -1054,16 +1054,19 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
 
   const handleLockCurrentMonth = async () => {
     const period = (dailyFilter.dateFrom || new Date().toISOString().slice(0, 10)).slice(0, 7);
+    const [pyy, pmm] = period.split("-").map(Number);
+    const dateFrom = `${period}-01`;
+    const dateTo = `${period}-${String(new Date(pyy, pmm, 0).getDate()).padStart(2, "0")}`;
     setLoading(true);
     try {
       // 1. 标记该月 daily_performance 为已锁定
       const { error } = await supabase.from("daily_performance")
         .update({ is_confirmed: true })
-        .like("trade_date", `${period}%`);
+        .gte("trade_date", dateFrom).lte("trade_date", dateTo);
       if (error) throw error;
 
       // 2. 汇总该月 daily_performance → trade_records（供提成计算），按交易员累加
-      const { data: dp } = await supabase.from("daily_performance").select("*").like("trade_date", `${period}%`);
+      const { data: dp } = await supabase.from("daily_performance").select("*").gte("trade_date", dateFrom).lte("trade_date", dateTo);
       const nameToId: Record<string, string> = {};
       for (const [id, cfg] of Object.entries(TRADERS)) nameToId[(cfg as any).name] = id;
       const resolveId = (tn: string) => (TRADERS as any)[tn] ? tn : (nameToId[tn] || tn);
