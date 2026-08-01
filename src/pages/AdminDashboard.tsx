@@ -2585,7 +2585,8 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
               .filter(m => !commPeriodsForId.has(m) && (m === curMonth || m === prevMonth))
               .reduce((sum, m) => {
                 const d = m === curMonth ? cur : prev;
-                return sum + (d.days > 0 ? d.commEst : 0);
+                // 本月即使 0 天也计入其提成估算（此时为纯固定月费，负数），以便预估月末余额反映固定扣除
+                return sum + ((d.days > 0 || m === curMonth) ? d.commEst : 0);
               }, 0);
             const projBal = bal + allDraftUsdId + unconfEst;
 
@@ -2631,13 +2632,14 @@ export default function AdminDashboard({ onLogout }: { onLogout: () => void }) {
                     </div>
 
                     {/* ── 待确认业绩（本月 + 上月 并排）── */}
-                    {(cur.days > 0 || prev.days > 0) && (
+                    {/* 本月始终展示（哪怕 0 天，用于滚动预估）；上月无数据时其半格留空 */}
+                    {(cur.days >= 0 || prev.days > 0) && (
                       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", borderTop: `1px solid ${C.border}` }}>
                         {[
                           { label: "本月", month: curMonth,  d: cur,  extra: true },
                           { label: "上月", month: prevMonth, d: prev, extra: false },
                         ].map(({ label, month, d, extra }, ci) => {
-                          if (d.days === 0) return <div key={month} />;
+                          if (d.days === 0 && month !== curMonth) return <div key={month} />;
                           const isDataConfirmed = dailyPerf.some(r => r.trader_name === id && r.trade_date.startsWith(month) && r.is_confirmed === true);
                           const confirmed = isConfirmed(month) || isDataConfirmed;
                           const tagColor  = confirmed ? C.green : C.warn;
