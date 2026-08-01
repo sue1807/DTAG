@@ -213,7 +213,7 @@ def _parse_csv_rows(content: str) -> list:
         except ValueError:
             continue
         def n(key, default=0.0):
-            v = row.get(key, "").strip()
+            v = row.get(key, "").strip().replace(",", "")   # 去千分位逗号，否则 float("-1,502.52") 会抛异常被吞成 0
             try: return float(v) if v else default
             except ValueError: return default
         rows.append({
